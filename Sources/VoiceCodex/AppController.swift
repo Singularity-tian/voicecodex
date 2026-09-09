@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import Darwin
 import VoiceCodexCore
 
 @MainActor
@@ -11,14 +12,24 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let hotkey = GlobalHotkey()
     private let overlay = RecordingOverlay()
     private var speech: RealtimeSTT?
-    private var runner: CodexRunner?
+    private var terminal: TerminalSession?
+    private var terminalLaunch: TerminalLaunchFiles?
+    private var monitorTask: Task<Void, Never>?
+    private var submitting = false
+    private var terminalActive = false
+    private var waitingForApproval = false
     private var recordingState = RecordingState.idle
     private var recordingGeneration = UUID()
     private var releaseRequested = false
-    private var queue: [String] = []
+    private struct PendingPrompt {
+        let id = UUID().uuidString
+        let text: String
+    }
+    private var queue: [PendingPrompt] = []
+    private var deliveryGeneration = 0
+    private var deliveryPaused = false
     private var executing = false
     private var runTask: Task<Void, Never>?
-    private var activeRunID: UUID?
     private var choosingProject = false
     private var terminating = false
     private var lastError = ""
@@ -89,6 +100,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                  (view.settingsButton, #selector(showSettings)),
                                  (view.stopButton, #selector(stopExecution)),
                                  (view.openWorktreeButton, #selector(openWorktree)),
+                                 (view.openTerminalButton, #selector(openTerminal)),
                                  (view.sendButton, #selector(sendTypedCommand))] {
             button.target = self
             button.action = action
@@ -256,98 +268,237 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func enqueue(_ text: String) {
-        queue.append(text)
-        appendHistory("你", text)
+        if !(deliveryPaused && queue.first?.text == text) {
+            queue.append(PendingPrompt(text: text))
+            appendHistory("你", text)
+        }
+        deliveryPaused = false
         lastError = ""
         updateState()
         executeNext()
     }
 
     private func executeNext() {
-        guard !executing, !queue.isEmpty, let projectPath = config.projectPath else { return }
+        guard !submitting, !queue.isEmpty, let projectPath = config.projectPath else { return }
         guard FileManager.default.isExecutableFile(atPath: config.codexPath) else {
             queue.removeAll()
             showFailure("没有找到 Codex CLI。请在设置中选择已安装的 codex 可执行文件，并先运行 codex login。")
             return
         }
-        let prompt = queue.removeFirst()
-        let runID = UUID()
-        activeRunID = runID
+        let submission = queue[0]
+        deliveryPaused = false
+        submitting = true
         executing = true
         updateState()
-        let processRunner = CodexRunner(executableURL: URL(fileURLWithPath: config.codexPath))
-        runner = processRunner
         runTask = Task { [weak self] in
             guard let self else { return }
+            var attemptedDelivery = false
+            var delivered = false
             do {
-                let workspace: URL
-                if let path = self.config.workspacePath, FileManager.default.fileExists(atPath: path) {
-                    workspace = URL(fileURLWithPath: path)
-                } else {
-                    self.view.taskLabel.stringValue = "正在创建工作目录…"
-                    let storage = LocalConfig.directory.appendingPathComponent("worktrees", isDirectory: true)
-                    let preparation = Task.detached {
-                        try WorkspaceManager.prepare(project: URL(fileURLWithPath: projectPath), storage: storage)
-                    }
-                    workspace = try await withTaskCancellationHandler {
-                        try await preparation.value
-                    } onCancel: {
-                        preparation.cancel()
-                    }
-                    self.config.workspacePath = workspace.path
-                    self.config.sessionID = nil
-                    try self.config.save()
-                    self.appendHistory("工作目录", workspace.path)
-                }
+                let workspace = try await self.prepareWorkspace(projectPath: projectPath)
+                let session = try await self.ensureTerminal(workspace: workspace)
                 try Task.checkCancellation()
-                self.updateProject()
-                self.view.taskLabel.stringValue = "Codex 正在执行…"
-                let result = try await processRunner.run(prompt: prompt, directory: workspace,
-                                                        sessionID: self.config.sessionID) { [weak self] event in
-                    Task { @MainActor in self?.receive(event, runID: runID) }
+                guard let terminal = self.terminal, self.terminalIsOpen else {
+                    throw DemoError.message("Terminal 已关闭。请重新发送指令。")
                 }
-                self.config.sessionID = result.sessionID ?? self.config.sessionID
-                try self.config.save()
-                self.appendHistory("Codex", result.answer.isEmpty ? "任务完成。" : result.answer)
-                if self.recordingState == .idle {
-                    self.showToast(title: "Codex 已完成", text: String(result.answer.prefix(100)))
-                }
+                attemptedDelivery = true
+                _ = try await terminal.enqueue(prompt: submission.text, sessionID: session, clientMessageID: submission.id)
+                try Task.checkCancellation()
+                guard self.terminal === terminal else { throw CancellationError() }
+                if self.queue.first?.id == submission.id { self.queue.removeFirst() }
+                delivered = true
+                self.deliveryGeneration += 1
+                self.terminalActive = true
+                self.appendHistory("Terminal", "指令已送达。完整执行过程、确认提示和回复在终端显示。")
                 self.lastError = ""
             } catch is CancellationError {
-                self.appendHistory("系统", "任务已停止。")
+                self.appendHistory("系统", "发送已取消。")
             } catch {
-                if !Task.isCancelled { self.showFailure(error.localizedDescription) }
+                if !Task.isCancelled {
+                    self.deliveryPaused = true
+                    if attemptedDelivery {
+                        // Queue IDs are correlation fields, not deduplication keys.
+                        // Never retry a request that might already have executed.
+                        if self.queue.first?.id == submission.id { self.queue.removeFirst() }
+                        self.showFailure(error.localizedDescription + " 送达状态未确认；请先查看 Terminal，再决定是否重发这条指令。")
+                    } else {
+                        self.showFailure(error.localizedDescription + " 指令已保留，打开终端后可继续发送。")
+                    }
+                }
             }
-            self.executing = false
-            self.activeRunID = nil
-            self.runner = nil
+            self.submitting = false
+            self.executing = self.terminalActive
             self.runTask = nil
             self.updateProject()
             self.updateState()
-            if !Task.isCancelled { self.executeNext() }
+            if !Task.isCancelled, delivered { self.executeNext() }
         }
     }
 
-    private func receive(_ event: CodexEvent, runID: UUID) {
-        guard activeRunID == runID else { return }
-        switch event {
-        case .sessionID(let id):
-            config.sessionID = id
-            try? config.save()
-            updateProject()
-        case .activity(let activity):
-            view.taskLabel.stringValue = String(activity.prefix(42))
-            appendHistory("执行", String(activity.prefix(1200)))
-        case .answer:
-            break // The authoritative final answer is appended once at run completion.
+    private func prepareWorkspace(projectPath: String) async throws -> URL {
+        if let path = config.workspacePath, FileManager.default.fileExists(atPath: path) {
+            return URL(fileURLWithPath: path)
+        }
+        view.taskLabel.stringValue = "正在创建工作目录…"
+        let storage = LocalConfig.directory.appendingPathComponent("worktrees", isDirectory: true)
+        let preparation = Task.detached {
+            try WorkspaceManager.prepare(project: URL(fileURLWithPath: projectPath), storage: storage)
+        }
+        let workspace = try await withTaskCancellationHandler {
+            try await preparation.value
+        } onCancel: { preparation.cancel() }
+        try Task.checkCancellation()
+        config.workspacePath = workspace.path
+        config.sessionID = nil
+        try config.save()
+        appendHistory("工作目录", workspace.path)
+        updateProject()
+        return workspace
+    }
+
+    private var terminalIsOpen: Bool {
+        guard let launch = terminalLaunch else { return false }
+        guard !FileManager.default.fileExists(atPath: launch.exitedURL.path),
+              let started = try? String(contentsOf: launch.startedURL, encoding: .utf8),
+              let pid = Int32(started.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 0 else { return false }
+        return Darwin.kill(pid, 0) == 0
+    }
+
+    private func ensureTerminal(workspace: URL) async throws -> String {
+        if !terminalIsOpen || terminal == nil {
+            closeTerminalConnection()
+            view.taskLabel.stringValue = "正在打开 Terminal…"
+            let connection = TerminalSession(executableURL: URL(fileURLWithPath: config.codexPath))
+            terminal = connection
+            let address = try await connection.start()
+            try Task.checkCancellation()
+            guard terminal === connection else { throw CancellationError() }
+            let launch = try TerminalLauncher.prepare(
+                executableURL: URL(fileURLWithPath: config.codexPath), workspaceURL: workspace,
+                remoteAddress: address, authTokenFileURL: connection.tokenFileURL,
+                prompt: nil, sessionID: config.sessionID,
+                storageURL: LocalConfig.directory.appendingPathComponent("terminal", isDirectory: true))
+            terminalLaunch = launch
+            guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") else {
+                throw DemoError.message("没有找到 macOS Terminal。")
+            }
+            let options = NSWorkspace.OpenConfiguration()
+            options.activates = true
+            _ = try await NSWorkspace.shared.open([launch.commandURL], withApplicationAt: app, configuration: options)
+            try Task.checkCancellation()
+            guard terminal === connection else { throw CancellationError() }
+            appendHistory("Terminal", "已打开交互式 Codex。首次使用时，请在终端完成启动提示。")
+        }
+        guard let connection = terminal, let launch = terminalLaunch else { throw CancellationError() }
+        view.taskLabel.stringValue = "等待终端就绪…"
+        let deadline = Date().addingTimeInterval(180)
+        while Date() < deadline {
+            try Task.checkCancellation()
+            if FileManager.default.fileExists(atPath: launch.exitedURL.path) {
+                throw DemoError.message("Codex 已退出。请查看 Terminal 中的错误，修复后重新发送。需要支持 --remote 的新版 Codex CLI。")
+            }
+            if terminalIsOpen,
+               let id = try await connection.discover(workspace: workspace, expectedSessionID: config.sessionID) {
+                try Task.checkCancellation()
+                guard terminal === connection else { throw CancellationError() }
+                config.sessionID = id
+                try config.save()
+                updateProject()
+                startTerminalMonitor(connection: connection, sessionID: id, launch: launch)
+                return id
+            }
+            try await Task.sleep(nanoseconds: 500_000_000)
+        }
+        throw DemoError.message("Terminal 尚未就绪，指令没有发送。请完成终端中的启动提示，再重新发送。")
+    }
+
+    private func startTerminalMonitor(connection: TerminalSession, sessionID: String, launch: TerminalLaunchFiles) {
+        guard monitorTask == nil else { return }
+        monitorTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                if !self.terminalIsOpen {
+                    self.appendHistory("Terminal", "终端会话已关闭。再次说话会恢复这个会话。")
+                    self.closeTerminalConnection()
+                    self.updateState()
+                    return
+                }
+                do {
+                    let generation = self.deliveryGeneration
+                    let state = try await connection.snapshot(sessionID: sessionID)
+                    try Task.checkCancellation()
+                    guard self.terminal === connection else { return }
+                    if self.deliveryGeneration != generation { continue }
+                    self.terminalActive = state.isActive
+                    self.waitingForApproval = state.waitingForApproval
+                    self.executing = self.submitting || state.isActive
+                    self.updateState()
+                    try await Task.sleep(nanoseconds: 1_000_000_000)
+                } catch is CancellationError { return }
+                catch {
+                    guard !Task.isCancelled, self.terminal === connection else { return }
+                    self.closeTerminalConnection()
+                    self.showFailure("Terminal 连接已断开：" + error.localizedDescription)
+                    return
+                }
+            }
+        }
+    }
+
+    private func closeTerminalConnection() {
+        monitorTask?.cancel()
+        monitorTask = nil
+        terminal?.shutdown()
+        terminal = nil
+        terminalLaunch = nil
+        terminalActive = false
+        waitingForApproval = false
+        executing = submitting
+    }
+
+    @objc private func openTerminal() {
+        guard !submitting, !choosingProject, !terminating else { return }
+        if terminalIsOpen {
+            if deliveryPaused && !queue.isEmpty { executeNext() }
+            NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Terminal").first?
+                .activate(options: [.activateAllWindows])
+            return
+        }
+        guard let projectPath = config.projectPath else { chooseProject(); return }
+        submitting = true
+        executing = true
+        updateState()
+        runTask = Task { [weak self] in
+            guard let self else { return }
+            var opened = false
+            do {
+                let workspace = try await self.prepareWorkspace(projectPath: projectPath)
+                _ = try await self.ensureTerminal(workspace: workspace)
+                opened = true
+            } catch is CancellationError { }
+            catch { if !Task.isCancelled { self.showFailure(error.localizedDescription) } }
+            self.submitting = false
+            self.executing = self.terminalActive
+            self.runTask = nil
+            self.updateState()
+            if !Task.isCancelled, opened { self.executeNext() }
         }
     }
 
     @objc private func stopExecution() {
         queue.removeAll()
         if recordingState != .idle { cancelRecording() }
-        runner?.cancel()
         runTask?.cancel()
+        if submitting {
+            closeTerminalConnection()
+        } else if let terminal, let id = config.sessionID {
+            Task {
+                do {
+                    try await terminal.interrupt(sessionID: id)
+                    appendHistory("系统", "已请求停止当前任务并清空排队指令。终端仍可继续使用。")
+                } catch { showFailure(error.localizedDescription) }
+            }
+        }
         updateState()
     }
 
@@ -380,10 +531,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func resetSession() {
+        closeTerminalConnection()
         config.workspacePath = nil
         config.sessionID = nil
-        activeRunID = nil
         queue.removeAll()
+        deliveryPaused = false
         lastError = ""
         history = ""
         view.results.string = "新任务已准备好。说出你的第一条指令。"
@@ -405,6 +557,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         view.projectButton.toolTip = config.projectPath
         view.sessionLabel.stringValue = config.sessionID.map { "会话 " + String($0.suffix(8)) } ?? "新会话"
         view.openWorktreeButton.isEnabled = config.workspacePath != nil
+        view.openTerminalButton.isEnabled = config.projectPath != nil && !submitting
     }
 
     private func updateState() {
@@ -412,7 +565,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         view.level.active = recording
         overlay.level.active = recording
         view.recordButton.title = recording ? "松开执行" : "按住说话"
-        view.stopButton.isEnabled = executing || recordingState != .idle
+        view.stopButton.isEnabled = executing || !queue.isEmpty || recordingState != .idle
+        view.openTerminalButton.isEnabled = config.projectPath != nil && !submitting
         view.newTaskButton.isEnabled = !executing && recordingState == .idle
         view.projectButton.isEnabled = !executing && recordingState == .idle
         view.providerLabel.stringValue = config.sonioxAPIKey.isEmpty ? "SONIOX  /  等待配置" : "SONIOX  /  LIVE STT"
@@ -422,12 +576,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         case .recording: state = "正在听"
         case .finishing: state = "正在转写"
         case .idle:
-            state = executing ? (queue.isEmpty ? "正在执行" : "执行中 · \(queue.count) 条排队") :
+            state = executing ? (waitingForApproval ? "请在终端确认" : (submitting ? "正在发送" : "终端执行中")) :
                 (!lastError.isEmpty ? "需要留意" : (config.sonioxAPIKey.isEmpty ? "等待配置" : "准备就绪"))
         }
         view.stateLabel.stringValue = "●  " + state
         view.stateLabel.textColor = !lastError.isEmpty && recordingState == .idle ? .systemOrange : Theme.green
-        if !executing { view.taskLabel.stringValue = config.sessionID == nil ? "等待第一条指令" : "可以继续说话" }
+        if !submitting {
+            view.taskLabel.stringValue = waitingForApproval ? "请在终端确认" :
+                (terminalActive ? "Codex 正在终端执行…" : (terminalIsOpen ? "终端已连接 · 可以继续说话" : "等待打开终端"))
+        }
         statusItem?.button?.image = NSImage(systemSymbolName: recording ? "mic.fill" : (executing ? "waveform.badge.mic" : "waveform"),
                                           accessibilityDescription: "VoiceCodex · " + state)
     }
@@ -522,13 +679,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if recordingState != .idle || executing {
             let alert = NSAlert()
             alert.messageText = "退出并停止当前任务？"
-            alert.informativeText = "当前录音或 Codex 进程会停止。已创建的工作目录会保留。"
+            alert.informativeText = "当前录音与本应用打开的 Codex 终端连接会停止。工作目录和会话会保留。"
             alert.addButton(withTitle: "退出")
             alert.addButton(withTitle: "继续运行")
             if alert.runModal() != .alertFirstButtonReturn { return .terminateCancel }
         }
         speech?.cancel()
-        runner?.cancel()
+        closeTerminalConnection()
         runTask?.cancel()
         hotkey.unregister()
         if let pending = runTask {

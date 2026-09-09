@@ -14,9 +14,9 @@ A small native macOS app that streams your voice to Soniox and sends the final t
 - Automatic submission on release; **Esc** cancels the current recording.
 - One independent Git worktree per new task, based on the selected checkout's committed HEAD.
 - Explicit Codex session IDs for follow-up instructions; new instructions queue while Codex runs.
-- A result window, completion overlay, text-input fallback, and a stop button.
+- A visible, interactive Codex session in **Terminal.app**, text-input fallback, and a stop button.
 
-This is an early demo. It runs a dedicated CLI session; use `codex resume SESSION_ID` to open that session in a terminal. Closing the window leaves the menu-bar app running.
+This is an early demo. Release the shortcut to send your instruction to a real Codex TUI in Terminal. Its output, tool calls, approval prompts, and replies appear there. You can also type directly in that terminal. Closing the VoiceCodex window leaves the menu-bar app running.
 
 ## Run
 
@@ -28,6 +28,8 @@ cd voicecodex
 ./script/build_and_run.sh --install
 ```
 
+Terminal mode requires a CLI with `--remote` and the app-server queue API; tested with **Codex CLI 0.153.2**.
+
 The script builds a local app bundle, signs it ad hoc, installs it at `~/Applications/VoiceCodex.app`, and launches it. It is a source-built demo, not a notarized distribution.
 
 Developers with a signing certificate can set `VOICECODEX_SIGNING_IDENTITY` to their own identity when building. A stable signing identity avoids repeated permission resets as the app changes.
@@ -35,7 +37,8 @@ Developers with a signing certificate can set `VOICECODEX_SIGNING_IDENTITY` to t
 1. Open **设置**, enter your Soniox key and check the Codex executable path. VoiceCodex reuses your existing `codex login` authentication.
 2. Click **选择项目** and pick a Git repository with at least one commit.
 3. Hold **⌃⌥Space**, allow the microphone on first use, then hold again and speak.
-4. Release to run. Look in the app for progress and results. Choose **新任务** to start fresh.
+4. Release to open **Terminal** and run. Complete any first-run Codex prompts in the terminal. Subsequent voice instructions go to that same session. Choose **新任务** to start fresh.
+5. Use **打开终端** to return to Terminal. Full output and any approval questions stay there; the app shows your submitted instructions and connection state.
 
 macOS may also request access to the folder containing your selected project. Allow that request to let Git read the repository; if a task times out while waiting for permission, allow access and retry.
 
@@ -45,7 +48,9 @@ You can also hold the **按住说话** button, or type a prompt in the bottom fi
 
 打开设置填入 Soniox API key，选择一个 Git 项目。按住 **Control + Option + Space** 说话，松手后自动交给 Codex；**Esc** 取消录音。第一次需要允许麦克风，授权后再次按住开始。
 
-新任务从项目已提交的 HEAD 创建独立 worktree。原目录中未提交的改动不会自动复制。继续说话会沿用同一个会话；Codex 正忙时，新指令进入队列。窗口关闭后仍可用全局快捷键，从菜单栏重新打开。
+松手后自动打开 macOS **Terminal**，运行真正的交互式 Codex。完整执行过程、工具输出、确认提示和回复都在终端显示，也可以直接键入。点 **打开终端** 随时切回。
+
+新任务从项目已提交的 HEAD 创建独立 worktree。原目录中未提交的改动不会自动复制。继续说话会沿用同一个会话；Codex 正忙时，新指令进入队列。关闭 Terminal 后，再次说话会恢复原会话；选择新任务会结束旧的终端连接，保留工作目录。关闭 VoiceCodex 窗口仍可用全局快捷键；从菜单栏退出应用会停止它管理的 Codex 服务。
 
 ## Local data and permissions
 
@@ -55,8 +60,9 @@ You can also hold the **按住说话** button, or type a prompt in the bottom fi
 - Settings, the Soniox credential, session IDs, and local transcript/output history live in `~/Library/Application Support/VoiceCodex/`. Config and history files use mode `0600`.
 - Task worktrees live under that directory's `worktrees/`. They are preserved when you start a new task; remove finished ones with `git worktree remove` when ready.
 - The Soniox key is used by the voice app and is not added to the Codex child-process environment. `SONIOX_API_KEY` is also supported for explicitly configured development launches.
-- Codex runs with `-a never` and `--sandbox workspace-write`. Commands permitted by that configuration run automatically; unavailable permissions produce a visible failure. This does not bypass Codex sandboxing.
-- Stop terminates the Codex CLI process and clears queued prompts. Already-completed edits remain; detached child processes are not independently managed by this demo.
+- The interactive TUI runs with `-a on-request`, `--sandbox workspace-write`, and `--no-alt-screen` to keep terminal scrollback. Approval prompts appear in Terminal. Tool-specific and macOS permissions still apply; Terminal mode does not grant access to a blocked app.
+- Each active VoiceCodex connection uses its own Codex app-server bound to `127.0.0.1`, protected by a random bearer token in a private local file. It does not replace or restart any existing Codex daemon. The Terminal launcher reads that token into a named environment variable; it is not embedded in the launch script or command arguments.
+- Stop clears pending instructions and requests interruption of the active turn; the terminal remains available for another instruction. Closing its Terminal session, starting a new task, or quitting VoiceCodex shuts down the server owned by the app. Already-completed edits remain; detached child processes are not independently managed by this demo.
 
 Do not put real API keys in the repository or bundle. Other users must supply their own credential; no shared public key is included.
 
@@ -75,10 +81,12 @@ The Codex app's Run action calls `script/build_and_run.sh`. Other modes include 
 | `GlobalHotkey` | Carbon global press/release events |
 | `RealtimeSTT` | AVAudioEngine capture, PCM conversion, Soniox streaming and finalization |
 | `AppController` | Recording lifecycle, prompt queue, session selection and local state |
-| `CodexRunner` | Direct process execution, literal stdin, JSONL events and cancellation |
+| `TerminalSession` | Authenticated local app-server, literal JSON prompts, queue, status and interruption |
+| `TerminalLauncher` | Private launch files for a real Codex TUI in Terminal.app |
+| `CodexRunner` | Original non-interactive runner, retained as a tested core utility |
 | `WorkspaceManager` | Git worktree creation without modifying the source checkout |
 
-Prompts are passed through stdin, never interpolated into a shell command. The STT adapter uses a documented public protocol; see [the Soniox integration notes](docs/soniox.md).
+Voice and typed prompts are sent as literal JSON over the authenticated local WebSocket, never interpolated into shell source. Terminal is opened using macOS application APIs; no simulated typing or AppleScript Automation permission is required. The STT adapter uses a documented public protocol; see [the Soniox integration notes](docs/soniox.md).
 
 ## License
 
