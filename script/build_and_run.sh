@@ -3,6 +3,7 @@ set -euo pipefail
 
 APP_NAME="VoiceCodex"
 BUNDLE_ID="com.singularity.voicecodex"
+SIGNING_IDENTITY="${VOICECODEX_SIGNING_IDENTITY:--}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="$ROOT_DIR/dist"
 APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
@@ -75,7 +76,7 @@ cat > "$STAGING_DIR/entitlements.plist" <<'PLIST'
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict><key>com.apple.security.device.audio-input</key><true/></dict></plist>
 PLIST
-/usr/bin/codesign --force --sign - --options runtime \
+/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime \
   --entitlements "$STAGING_DIR/entitlements.plist" "$STAGED_BUNDLE"
 /usr/bin/codesign --verify --strict "$STAGED_BUNDLE"
 rm -rf "$APP_BUNDLE"

@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+import Darwin
 @testable import VoiceCodexCore
 
 final class WorkspaceManagerTests: XCTestCase {
@@ -47,6 +48,89 @@ final class WorkspaceManagerTests: XCTestCase {
             XCTAssertTrue(error.localizedDescription.contains("Git"))
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: storage.path))
+    }
+
+    func testStalledGitTimesOutAndKillsProcessThatIgnoresTermination() throws {
+        let temporary = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let (executable, pidFile) = try blockingGit(in: temporary)
+        let started = ProcessInfo.processInfo.systemUptime
+
+        XCTAssertThrowsError(try WorkspaceManager.git(
+            ["rev-parse", "--show-toplevel"], in: temporary,
+            executable: executable, timeout: 1
+        )) { error in
+            guard case WorkspaceManager.WorkspaceError.gitTimedOut = error else {
+                return XCTFail("Expected timeout, got \(error)")
+            }
+            XCTAssertTrue(error.localizedDescription.contains("系统弹窗"))
+        }
+
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - started, 3)
+        try assertProcessStopped(pidFile: pidFile)
+    }
+
+    func testCancellingStalledGitStopsPromptlyWithoutWaitingForDeadline() async throws {
+        let temporary = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let (executable, pidFile) = try blockingGit(in: temporary)
+        let task = Task.detached {
+            try WorkspaceManager.git(
+                ["rev-parse", "--show-toplevel"], in: temporary,
+                executable: executable, timeout: 30
+            )
+        }
+        defer { task.cancel() }
+        let readyDeadline = ProcessInfo.processInfo.systemUptime + 2
+        while !FileManager.default.fileExists(atPath: pidFile.path)
+                && ProcessInfo.processInfo.systemUptime < readyDeadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: pidFile.path), "Fake Git must be running before cancellation")
+        let cancelledAt = ProcessInfo.processInfo.systemUptime
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "Expected cancellation, got \(error)")
+        }
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - cancelledAt, 2)
+        try assertProcessStopped(pidFile: pidFile)
+    }
+
+    func testGitDrainsOutputLargerThanThePipeBuffer() throws {
+        let temporary = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let executable = temporary.appendingPathComponent("verbose-git")
+        try "#!/bin/sh\n/usr/bin/head -c 262144 /dev/zero\n".write(
+            to: executable, atomically: true, encoding: .utf8
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        let result = try WorkspaceManager.git([], in: temporary, executable: executable, timeout: 2)
+        XCTAssertEqual(result.status, 0)
+        XCTAssertEqual(result.output.utf8.count, 262_144)
+    }
+
+    private func blockingGit(in directory: URL) throws -> (executable: URL, pidFile: URL) {
+        let executable = directory.appendingPathComponent("stalled-git")
+        let pidFile = directory.appendingPathComponent("child.pid")
+        let quotedPIDPath = "'" + pidFile.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        // Ignore TERM, then replace the shell so the test has exactly one child
+        // process and proves the bounded KILL escalation rather than orphaning it.
+        let script = "#!/bin/sh\ntrap '' TERM\nprintf '%s' \"$$\" > \(quotedPIDPath)\nprintf 'partial output\\n'\nexec /bin/sleep 30\n"
+        try script.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        return (executable, pidFile)
+    }
+
+    private func assertProcessStopped(pidFile: URL, file: StaticString = #filePath, line: UInt = #line) throws {
+        let pidText = try String(contentsOf: pidFile, encoding: .utf8)
+        let pid = try XCTUnwrap(Int32(pidText), file: file, line: line)
+        let status = Darwin.kill(pid, 0)
+        let error = errno
+        XCTAssertEqual(status, -1, "Child process must not survive", file: file, line: line)
+        XCTAssertEqual(error, ESRCH, file: file, line: line)
     }
 
     private func temporaryDirectory() throws -> URL {

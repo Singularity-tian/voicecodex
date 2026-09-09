@@ -129,6 +129,7 @@ final class MainView: NSView {
 
         let icon = NSImageView(image: NSImage(systemSymbolName: "waveform.circle.fill", accessibilityDescription: "VoiceCodex")!)
         icon.contentTintColor = Theme.green
+        icon.imageScaling = .scaleProportionallyUpOrDown
         icon.widthAnchor.constraint(equalToConstant: 34).isActive = true
         icon.heightAnchor.constraint(equalToConstant: 34).isActive = true
         let wordmark = vstack([textLabel("VoiceCodex", size: 18, weight: .semibold),

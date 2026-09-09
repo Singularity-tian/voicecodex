@@ -30,10 +30,14 @@ cd voicecodex
 
 The script builds a local app bundle, signs it ad hoc, installs it at `~/Applications/VoiceCodex.app`, and launches it. It is a source-built demo, not a notarized distribution.
 
+Developers with a signing certificate can set `VOICECODEX_SIGNING_IDENTITY` to their own identity when building. A stable signing identity avoids repeated permission resets as the app changes.
+
 1. Open **设置**, enter your Soniox key and check the Codex executable path. VoiceCodex reuses your existing `codex login` authentication.
 2. Click **选择项目** and pick a Git repository with at least one commit.
 3. Hold **⌃⌥Space**, allow the microphone on first use, then hold again and speak.
 4. Release to run. Look in the app for progress and results. Choose **新任务** to start fresh.
+
+macOS may also request access to the folder containing your selected project. Allow that request to let Git read the repository; if a task times out while waiting for permission, allow access and retry.
 
 You can also hold the **按住说话** button, or type a prompt in the bottom field and press Return.
 

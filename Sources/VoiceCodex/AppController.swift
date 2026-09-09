@@ -286,9 +286,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 } else {
                     self.view.taskLabel.stringValue = "正在创建工作目录…"
                     let storage = LocalConfig.directory.appendingPathComponent("worktrees", isDirectory: true)
-                    workspace = try await Task.detached {
+                    let preparation = Task.detached {
                         try WorkspaceManager.prepare(project: URL(fileURLWithPath: projectPath), storage: storage)
-                    }.value
+                    }
+                    workspace = try await withTaskCancellationHandler {
+                        try await preparation.value
+                    } onCancel: {
+                        preparation.cancel()
+                    }
                     self.config.workspacePath = workspace.path
                     self.config.sessionID = nil
                     try self.config.save()
@@ -382,6 +387,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         lastError = ""
         history = ""
         view.results.string = "新任务已准备好。说出你的第一条指令。"
+        view.transcript.string = "试着说：帮我看看这个项目，下一步可以做什么。"
+        view.transcript.textColor = Theme.muted
         persistHistory()
         do { try config.save() } catch { showFailure(error.localizedDescription) }
         updateProject()
