@@ -10,9 +10,12 @@ public struct TerminalSnapshot: Sendable {
 
 public enum TerminalSessionError: LocalizedError {
     case message(String)
+    case rpc(code: Int, message: String)
     public var errorDescription: String? {
-        if case let .message(message) = self { return message }
-        return nil
+        switch self {
+        case let .message(message): return message
+        case let .rpc(_, message): return "Codex: " + message
+        }
     }
 }
 
@@ -34,8 +37,50 @@ public final class TerminalSession {
     private var pending: [Int: CheckedContinuation<[String: Any], Error>] = [:]
     private var deadlines: [Int: Task<Void, Never>] = [:]
     private var activeTurns: [String: String] = [:]
+    private var requestHandler: ((String, [String: Any]) async throws -> [String: Any])?
 
     public init(executableURL: URL) { self.executableURL = executableURL }
+
+    // Allows deterministic protocol fixtures without launching a CLI or using
+    // account credentials. The production initializer always uses WebSocket RPC.
+    init(executableURL: URL, requestHandler: @escaping (String, [String: Any]) async throws -> [String: Any]) {
+        self.executableURL = executableURL
+        self.requestHandler = requestHandler
+    }
+
+    /// An empty TUI has a live UUID before Codex writes restorable history. A
+    /// replacement server must validate that UUID before launching `resume`.
+    public func restorableSessionID(_ id: String?, workspace: URL) async throws -> String? {
+        guard let id else { return nil }
+        guard let uuid = UUID(uuidString: id) else {
+            throw TerminalSessionError.message("保存的 Codex 会话 ID 无效，请创建新任务。")
+        }
+        let canonicalID = uuid.uuidString.lowercased()
+        let metadata: [String: Any]
+        do {
+            metadata = try await thread(canonicalID)
+        } catch let TerminalSessionError.rpc(code, message)
+                    where code == -32600 && message == "thread not loaded: \(canonicalID)" {
+            // Verified app-server response for a missing or never-persisted
+            // thread. Other RPC, permission, and connection failures propagate.
+            return nil
+        }
+        guard let cwd = metadata["cwd"] as? String,
+              Self.sameDirectory(URL(fileURLWithPath: cwd), workspace) else {
+            throw TerminalSessionError.message("保存的 Codex 会话属于另一个工作目录；会话已保留，请检查项目设置。")
+        }
+        let history: [String: Any]
+        do {
+            history = try await request("thread/turns/list", ["threadId": canonicalID, "limit": 1, "itemsView": "summary"])
+        } catch let TerminalSessionError.rpc(code, message)
+                    where code == -32600 && message == "no rollout found for thread id \(canonicalID)" {
+            return nil
+        }
+        guard let turns = history["data"] as? [[String: Any]] else {
+            throw TerminalSessionError.message("无法确认保存的 Codex 会话历史；会话已保留，请稍后重试。")
+        }
+        return turns.isEmpty ? nil : id
+    }
 
     public func start() async throws -> String {
         if let remoteAddress, server?.isRunning == true, socket != nil { return remoteAddress }
@@ -249,6 +294,7 @@ public final class TerminalSession {
 
     private func request(_ method: String, _ parameters: [String: Any], timeout: Double = 15) async throws -> [String: Any] {
         try Task.checkCancellation()
+        if let requestHandler { return try await requestHandler(method, parameters) }
         guard socket != nil else { throw TerminalSessionError.message("Codex 终端尚未连接。") }
         nextRequestID += 1
         let id = nextRequestID
@@ -283,7 +329,7 @@ public final class TerminalSession {
         if let id = message["id"] as? Int, message["method"] == nil {
             if let error = message["error"] as? [String: Any] {
                 let detail = String((error["message"] as? String ?? "请求失败").prefix(1_200))
-                finish(id, .failure(TerminalSessionError.message("Codex: " + detail)))
+                finish(id, .failure(TerminalSessionError.rpc(code: error["code"] as? Int ?? -32603, message: detail)))
             } else {
                 finish(id, .success(message["result"] as? [String: Any] ?? [:]))
             }
