@@ -1,0 +1,12 @@
+.build/
+dist/
+.DS_Store
+.env
+.env.*
+!.env.example
+*.local.json
+*.local.toml
+*.wav
+*.pcm
+*.log
+.swiftpm/
