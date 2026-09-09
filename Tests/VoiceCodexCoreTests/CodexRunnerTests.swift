@@ -136,13 +136,16 @@ final class CodexRunnerTests: XCTestCase {
         """)
         let runner = CodexRunner(executableURL: executable)
         let events = EventRecorder()
+        let started = expectation(description: "The child reports its running session")
         let task = Task {
             try await runner.run(prompt: "wait", directory: fixture.directory,
-                                 sessionID: nil, onEvent: { events.append($0) })
+                                 sessionID: nil, onEvent: { event in
+                events.append(event)
+                if case .sessionID("running") = event { started.fulfill() }
+            })
         }
-        for _ in 0..<100 where events.values.isEmpty {
-            try await Task.sleep(nanoseconds: 20_000_000)
-        }
+        // Startup latency is independent of the cancellation deadline below.
+        await fulfillment(of: [started], timeout: 10)
         XCTAssertEqual(events.values.first, "session:running")
         let start = Date()
         runner.cancel()
@@ -167,13 +170,16 @@ final class CodexRunnerTests: XCTestCase {
         """)
         let runner = CodexRunner(executableURL: executable)
         let events = EventRecorder()
+        let started = expectation(description: "The child reports its running session")
         let task = Task {
             try await runner.run(prompt: "wait", directory: fixture.directory,
-                                 sessionID: nil, onEvent: { events.append($0) })
+                                 sessionID: nil, onEvent: { event in
+                events.append(event)
+                if case .sessionID("running") = event { started.fulfill() }
+            })
         }
-        for _ in 0..<100 where events.values.isEmpty {
-            try await Task.sleep(nanoseconds: 20_000_000)
-        }
+        // Startup latency is independent of the cancellation deadline below.
+        await fulfillment(of: [started], timeout: 10)
         task.cancel()
         do {
             _ = try await task.value

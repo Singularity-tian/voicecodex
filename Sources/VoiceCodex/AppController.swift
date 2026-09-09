@@ -128,8 +128,22 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func showWindow() {
+        guard let window, !terminating else { return }
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        NSApp.unhide(nil)
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        // The menu-bar process survives the red close button. Finder/Spotlight
+        // opening the app again must restore the existing window and session.
+        showWindow()
+        return false
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
     }
 
     private func beginRecording() {
@@ -373,10 +387,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let address = try await connection.start()
             try Task.checkCancellation()
             guard terminal === connection else { throw CancellationError() }
+            let resumeID = try await connection.restorableSessionID(config.sessionID, workspace: workspace)
+            try Task.checkCancellation()
+            guard terminal === connection else { throw CancellationError() }
+            if config.sessionID != resumeID {
+                config.sessionID = resumeID
+                try config.save()
+                updateProject()
+            }
             let launch = try TerminalLauncher.prepare(
                 executableURL: URL(fileURLWithPath: config.codexPath), workspaceURL: workspace,
                 remoteAddress: address, authTokenFileURL: connection.tokenFileURL,
-                prompt: nil, sessionID: config.sessionID,
+                prompt: nil, sessionID: resumeID,
                 storageURL: LocalConfig.directory.appendingPathComponent("terminal", isDirectory: true))
             terminalLaunch = launch
             guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") else {

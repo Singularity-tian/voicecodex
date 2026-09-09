@@ -16,7 +16,7 @@ A small native macOS app that streams your voice to Soniox and sends the final t
 - Explicit Codex session IDs for follow-up instructions; new instructions queue while Codex runs.
 - A visible, interactive Codex session in **Terminal.app**, text-input fallback, and a stop button.
 
-This is an early demo. Release the shortcut to send your instruction to a real Codex TUI in Terminal. Its output, tool calls, approval prompts, and replies appear there. You can also type directly in that terminal. Closing the VoiceCodex window leaves the menu-bar app running.
+This is an early demo. Release the shortcut to send your instruction to a real Codex TUI in Terminal. Its output, tool calls, approval prompts, and replies appear there. You can also type directly in that terminal. Closing the VoiceCodex window leaves the menu-bar app running. Open VoiceCodex again from Finder or Spotlight to restore that same window; the menu-bar menu also has an Open VoiceCodex action.
 
 ## Run
 
@@ -50,7 +50,7 @@ You can also hold the **按住说话** button, or type a prompt in the bottom fi
 
 松手后自动打开 macOS **Terminal**，运行真正的交互式 Codex。完整执行过程、工具输出、确认提示和回复都在终端显示，也可以直接键入。点 **打开终端** 随时切回。
 
-新任务从项目已提交的 HEAD 创建独立 worktree。原目录中未提交的改动不会自动复制。继续说话会沿用同一个会话；Codex 正忙时，新指令进入队列。关闭 Terminal 后，再次说话会恢复原会话；选择新任务会结束旧的终端连接，保留工作目录。关闭 VoiceCodex 窗口仍可用全局快捷键；从菜单栏退出应用会停止它管理的 Codex 服务。
+新任务从项目已提交的 HEAD 创建独立 worktree。原目录中未提交的改动不会自动复制。继续说话会沿用同一个会话；Codex 正忙时，新指令进入队列。关闭 Terminal 后，再次说话会恢复原会话；选择新任务会结束旧的终端连接，保留工作目录。关闭 VoiceCodex 窗口仍可用全局快捷键；再次从 Finder 或 Spotlight 打开 VoiceCodex，会恢复原窗口和会话。菜单栏也有「打开 VoiceCodex」入口。从菜单栏退出应用会停止它管理的 Codex 服务。
 
 ## Local data and permissions
 
