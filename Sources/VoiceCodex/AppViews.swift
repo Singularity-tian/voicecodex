@@ -116,11 +116,12 @@ final class MainView: NSView {
     let settingsButton = NSButton(title: "设置", target: nil, action: nil)
     let stopButton = NSButton(title: "停止", target: nil, action: nil)
     let openWorktreeButton = NSButton(title: "打开工作目录", target: nil, action: nil)
+    let openTerminalButton = NSButton(title: "打开终端", target: nil, action: nil)
     let commandField = NSTextField()
-    let sendButton = NSButton(title: "执行 ↗", target: nil, action: nil)
-    let taskLabel = textLabel("等待第一条指令", size: 11, color: Theme.muted)
+    let sendButton = NSButton(title: "发送 ↗", target: nil, action: nil)
+    let taskLabel = textLabel("等待打开终端", size: 11, color: Theme.muted)
     let sessionLabel = textLabel("新会话", size: 10, color: Theme.muted)
-    let footerLabel = textLabel("按住期间，音频实时发送至 Soniox。Esc 取消录音。", size: 10, color: Theme.muted)
+    let footerLabel = textLabel("按住期间，音频实时发送至 Soniox。Esc 取消录音。执行与审批在 Terminal 中进行。", size: 10, color: Theme.muted)
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -139,7 +140,7 @@ final class MainView: NSView {
         settingsButton.font = .systemFont(ofSize: 11)
 
         let hero = vstack([textLabel("说一句，交给 Codex。", size: 32, weight: .semibold),
-                           textLabel("在任何 App 里按住快捷键。松手，工作就开始。", size: 13, color: Theme.muted)], spacing: 8)
+                           textLabel("松手后，在 Terminal 里执行并显示过程。", size: 13, color: Theme.muted)], spacing: 8)
         let shortcut = hstack([shortcutLabel, textLabel("按住说话 · 松开执行", size: 12, color: Theme.muted),
                               spacer(), level, recordButton], spacing: 16)
         recordButton.bezelStyle = .rounded
@@ -173,7 +174,7 @@ final class MainView: NSView {
                                 spacer(), sessionLabel, newTaskButton])
 
         setupTextView(results, font: .systemFont(ofSize: 13))
-        results.string = "你的指令和 Codex 的执行结果会显示在这里。\n\n每个新任务在独立 worktree 中运行；继续说话会沿用同一个会话。"
+        results.string = "这里记录你发送的语音和文字指令。\n\n完整执行过程、审批提示和结果会在 Terminal 的 Codex 会话中显示。\n每个新任务使用独立工作目录；继续说话会沿用同一个会话。"
         results.textColor = Theme.muted
         results.setAccessibilityIdentifier("execution-results")
         let resultScroll = scrolling(results)
@@ -185,13 +186,21 @@ final class MainView: NSView {
         openWorktreeButton.bezelStyle = .inline
         openWorktreeButton.font = .systemFont(ofSize: 11)
         openWorktreeButton.isEnabled = false
-        let resultHeader = hstack([textLabel("执行记录", size: 12, weight: .semibold), taskLabel,
-                                   spacer(), openWorktreeButton, stopButton])
+        openTerminalButton.bezelStyle = .rounded
+        openTerminalButton.controlSize = .small
+        openTerminalButton.font = .systemFont(ofSize: 11, weight: .semibold)
+        openTerminalButton.contentTintColor = Theme.green
+        openTerminalButton.image = NSImage(systemSymbolName: "terminal", accessibilityDescription: nil)
+        openTerminalButton.imagePosition = .imageLeading
+        openTerminalButton.setAccessibilityLabel("打开终端")
+        taskLabel.setContentCompressionResistancePriority(.init(400), for: .horizontal)
+        let resultHeader = hstack([textLabel("指令记录", size: 12, weight: .semibold), taskLabel,
+                                   spacer(), openWorktreeButton, openTerminalButton, stopButton])
         let resultContent = vstack([resultHeader, resultScroll], spacing: 14)
         [resultHeader, resultScroll].forEach { $0.widthAnchor.constraint(equalTo: resultContent.widthAnchor).isActive = true }
         let resultCard = CardView(content: resultContent)
 
-        commandField.placeholderString = "也可以输入一句指令，按回车执行…"
+        commandField.placeholderString = "输入指令，按回车发送到 Terminal…"
         commandField.font = .systemFont(ofSize: 13)
         commandField.bezelStyle = .roundedBezel
         commandField.controlSize = .large
@@ -202,7 +211,7 @@ final class MainView: NSView {
         sendButton.controlSize = .large
         sendButton.contentTintColor = Theme.green
         let inputRow = hstack([commandField, sendButton])
-        let footer = hstack([footerLabel, spacer(), textLabel("DEMO  ·  0.1", size: 9, weight: .medium, color: Theme.muted)])
+        let footer = hstack([footerLabel, spacer(), textLabel("DEMO  ·  0.2", size: 9, weight: .medium, color: Theme.muted)])
 
         let layout = vstack([top, hero, voiceCard, projectRow, resultCard, inputRow, footer], spacing: 18)
         layout.setCustomSpacing(28, after: top)
