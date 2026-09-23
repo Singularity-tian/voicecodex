@@ -4,6 +4,8 @@
 
 A native macOS voice controller with two modes: **Jev** selects native Mac actions, and **Codex** continues your coding session in Terminal. Soniox provides live Chinese / English transcription. Hold the shortcut from another app and release to execute.
 
+Chinese and English can be mixed in one command. Every recording automatically loads installed App names and common Chinese/English aliases as Soniox vocabulary, prioritizing the current and running apps. The transcription panel shows the loaded hotword count; no manual language switch is needed.
+
 ![VoiceCodex](docs/screenshot.jpg)
 
 ## Control your Mac with Jev
@@ -96,6 +98,7 @@ You can also hold the **按住说话** button, or type a prompt in the bottom fi
 ## Local data and permissions
 
 - Audio is captured only for an explicit recording and streamed to **Soniox**. VoiceCodex keeps audio in memory and does not save recordings.
+- Each recording also sends **Soniox** a bounded vocabulary of installed App display names and known aliases. It contains no app paths, window titles, documents, or history; see [speech configuration](docs/soniox.md).
 - The app waits for Soniox's final completion response. A network or transcription error does not execute a partial transcript.
 - Final text is sent to **Codex**, using the account and provider configuration already configured for your CLI.
 - In Mac mode, the routing instruction and app names/identifiers are sent to **TypeSafe**. Recognized literal typing payloads are replaced with a placeholder and remain local during planning. A click command additionally sends bounded Accessibility role/title/description text for the selected window. Screenshots, clipboard contents, and whole documents are not sent to Jev. Transcripts and action receipts are saved privately in `mac-history.txt`, separately from the coding session history.

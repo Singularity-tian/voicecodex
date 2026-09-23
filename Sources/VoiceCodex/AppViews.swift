@@ -257,7 +257,7 @@ final class MainView: NSView {
         openWorktreeButton.isHidden = mac
         openTerminalButton.isHidden = mac
         commandField.placeholderString = mac ? "例如：打开便笺；然后说：输入「hello world」" : "输入指令，按回车发送到 Terminal…"
-        footerLabel.stringValue = mac ? "按住时音频发送至 Soniox；指令和必要的控件文字发送至 TypeSafe。Esc 随时停止。" : "按住期间，音频实时发送至 Soniox。Esc 取消录音。执行与审批在 Terminal 中进行。"
+        footerLabel.stringValue = mac ? "音频和 App 热词发送至 Soniox；指令和必要的控件文字发送至 TypeSafe。Esc 随时停止。" : "音频和 App 热词发送至 Soniox。Esc 取消录音。执行与审批在 Terminal 中进行。"
     }
 
     private func separator() -> NSView {

@@ -13,16 +13,20 @@ The following checks use local credentials and make paid requests only with `--l
 
 ```sh
 swiftc Sources/VoiceCodexCore/EnvironmentFile.swift \
-  Sources/VoiceCodexCore/MacCommand.swift Sources/VoiceCodexCore/JevClient.swift \
+  Sources/VoiceCodexCore/MacCommand.swift Sources/VoiceCodexCore/SpeechVocabulary.swift \
+  Sources/VoiceCodexCore/JevClient.swift \
   script/jev_live_check.swift -o .build/jev-live-check
 .build/jev-live-check --live
 .build/jev-live-check --live --installed-apps --output .build/qa/jev-live-installed-apps.json
 ./script/test_speech_live.sh --live
+./script/test_speech_live.sh --live --vocabulary-ab
 ```
 
 The planner matrix checks Chinese/English app names, current/named targets, tabs versus windows, exact text including emoji and line breaks, quoted command words, scroll/copy/paste/undo/Return/click intents, and rejection of missing targets, unavailable apps, ambiguous typing destinations, unsupported operations, and multi-step requests. Every successful case checks the exact action, app, and literal text. A safe rejection is expected only for the explicitly negative cases. The installed-app option uses real bundle metadata and a focused subset; it does not read windows or operate apps.
 
 The speech script synthesizes five fixed English/Mandarin phrases to files with built-in macOS voices, uses the production PCM encoder and Soniox streaming/finalization code, and passes the confirmed transcript to the real Jev client. Three cases open apps; two insert literal text into a captured TextEdit target. Speech has no intrinsic letter case or punctuation: the typing oracle accepts an explicit small set of transcript formatting variants, independently of the production parser. It does not play audio, capture the microphone, or test the global hotkey.
+
+The vocabulary A/B option uses the real installed-app catalog and up to ten fixed public app-name phrases; fixtures for absent apps are skipped. It compares the original six terms with the production app vocabulary, keeping the general context identical. Each pair reuses the same PCM bytes, records their SHA-256, and alternates arm order. It checks final transcript completion, app-name recognition, and the exact Jev action and target separately. Inventory names are sent as the requested recognition context but are not saved in the report. Use `--filter FIXTURE_ID` for a targeted recheck. Clean synthetic speech can verify the pipeline; it cannot establish accuracy for a person's accent or microphone.
 
 ## Disposable desktop target
 
@@ -65,3 +69,12 @@ Use disposable windows for close-all testing. Do not close existing user documen
 - The final installed app opened Calculator, Stickies, Chrome, and the disposable QA app. It correctly classified a quoted command as literal input and stopped at the missing Accessibility permission; a multi-step typing request was rejected without execution. Expanded native input/tab/click/confirmation tests remain pending user-granted Accessibility. Microphone hardware and global push-to-talk have not been independently exercised by the test harness.
 
 These are bounded regression results, not a claim that every phrasing or application works. Live model decisions can vary; preserve failures and retest the changed behavior rather than lowering the confidence threshold to hide a failure.
+
+## Application vocabulary validation — 2026-09-23
+
+- 106 unit tests passed, including encoded Soniox language/context configuration, bilingual app aliases, deduplication, sanitization, current-app priority, and the complete-context size bound.
+- Final app built, signed, installed, and its running process verified. The installed UI visibly showed `SONIOX · 中文 / English · 166 热词`; the screenshot is retained locally under ignored `.build/qa`.
+- The production catalog represented all 132 installed applications with 166 terms in 2,204 UTF-8 bytes, with no applications omitted. Safari and Finder were included through verified Launch Services bundle resolution.
+- Eight public app-name clips tested Chrome in English/mixed speech, Apple Notes and Stickies in English/Chinese, and Feishu and WeChat in Chinese. Both arms passed 8/8 for finalized transcripts, recognized app names, and correct Jev targets: 16/16 live Soniox-to-Jev evaluations. The original six-term arm used the same general context as the application arm. VS Code fixtures were skipped because the app was not installed.
+- Seven pairs ran together; the Feishu fixture's bundle ID was then corrected to match the installed app and its pair ran separately. Each pair used identical PCM bytes. Original reports and the combined summary remain in ignored `.build/qa`.
+- Both arms already succeeded on these clean clips. No measurable accuracy improvement was demonstrated, and microphone capture, personal pronunciation, and desktop action execution were not tested by this A/B harness.

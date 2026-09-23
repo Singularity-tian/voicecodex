@@ -50,6 +50,24 @@ final class JevClientTests: XCTestCase {
         XCTAssertEqual(result.applicationID, "com.apple.Stickies")
     }
 
+    func testSpeechAliasesAlsoDescribeInstalledCommandTargets() async throws {
+        let app = MacApplication(id: "com.apple.Notes", name: "Notes")
+        let fixture = JevHTTPFixture { request in
+            let body = try Self.body(request)
+            let state = try XCTUnwrap(body["state"] as? [String: String])
+            XCTAssertTrue(state["mentioned_installed_applications"]?.contains("com.apple.Notes") == true)
+            let questions = try XCTUnwrap(body["questions"] as? [String: [String: Any]])
+            let criteria = try XCTUnwrap(questions["application"]?["criteria"] as? [String: String])
+            XCTAssertTrue(criteria["app_0"]?.contains("备忘录") == true)
+            XCTAssertTrue(criteria["app_0"]?.contains("Apple Notes") == true)
+            return (200, try Self.answer(request, choices: ["action": "openApp", "application": "app_0"]))
+        }
+        defer { fixture.close() }
+        let result = try await fixture.client.plan(transcript: "打开备忘录", applications: [app], currentApplicationID: nil)
+        XCTAssertEqual(result.applicationID, app.id)
+        XCTAssertTrue(SpeechVocabulary.build(applications: [app], currentApplicationID: nil).terms.contains("备忘录"))
+    }
+
     func testLargeAppListPreservesLateTargetThroughHierarchicalChoice() async throws {
         let apps = (0..<1_000).map { MacApplication(id: "com.example.App\($0)", name: "Application \($0)") }
         let fixture = JevHTTPFixture { request in

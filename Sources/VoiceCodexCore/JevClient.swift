@@ -83,7 +83,7 @@ public final class JevClient: @unchecked Sendable {
             // literal text. Require quotes rather than type destination words
             // into whichever app happened to be foreground.
             for application in applications {
-                let names = [application.name, application.id] + (Self.applicationAliases[application.id] ?? [])
+                let names = [application.name, application.id] + MacApplicationAliases.aliases(forBundleIdentifier: application.id)
                 if names.contains(where: { name in
                     let suffix = #"(?:\b(?:in|into|to)\s+|(?:到|在|至)\s*)"# +
                         NSRegularExpression.escapedPattern(for: name) + #"\s*(?:里|中)?[.!?。！？]?\s*$"#
@@ -108,7 +108,7 @@ public final class JevClient: @unchecked Sendable {
             // Stickies app from creating a new sticky without seeing another
             // question's criteria. This metadata never executes an action.
             "mentioned_installed_applications": applications.filter { application in
-                ([application.name, application.id] + (Self.applicationAliases[application.id] ?? [])).contains {
+                ([application.name, application.id] + MacApplicationAliases.aliases(forBundleIdentifier: application.id)).contains {
                     routingTranscript.range(of: $0, options: .caseInsensitive) != nil
                 }
             }.map(Self.applicationDescription).joined(separator: "; ")
@@ -279,18 +279,10 @@ public final class JevClient: @unchecked Sendable {
     /// Aliases describe known bundle IDs already present in the local inventory;
     /// they do not introduce guessed or uninstalled application targets.
     private static func applicationDescription(_ application: MacApplication) -> String {
+        let aliases = MacApplicationAliases.aliases(forBundleIdentifier: application.id)
         return "\(application.name) (\(application.id))" +
-            (applicationAliases[application.id].map { " — also called \($0.joined(separator: ", "))" } ?? "")
+            (aliases.isEmpty ? "" : " — also called \(aliases.joined(separator: ", "))")
     }
-
-    private static let applicationAliases: [String: [String]] = [
-        "com.google.Chrome": ["Chrome", "谷歌浏览器"],
-        "com.apple.calculator": ["Calculator", "计算器"],
-        "com.apple.Stickies": ["Stickies", "便笺", "便签"],
-        "com.apple.TextEdit": ["TextEdit", "文本编辑"],
-        "com.apple.finder": ["Finder", "访达"],
-        "com.apple.systempreferences": ["System Settings", "System Preferences", "系统设置", "系统偏好设置"]
-    ]
 }
 
 private struct EvaluationRequest: Encodable {

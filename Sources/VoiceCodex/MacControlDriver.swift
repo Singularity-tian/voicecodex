@@ -86,7 +86,15 @@ final class MacControlDriver {
                 } else if entries.level > 3 { entries.skipDescendants() }
             }
         }
-        // Includes standard apps such as Finder that live outside those roots.
+        // macOS can hide Safari's application symlink, and Finder lives outside
+        // the scanned application folders. Resolve their installed bundles via
+        // Launch Services rather than depending on OS-version-specific paths.
+        for id in ["com.apple.Safari", "com.apple.finder"] where urls[id] == nil {
+            if let url = workspace.urlForApplication(withBundleIdentifier: id), Bundle(url: url)?.bundleIdentifier == id {
+                urls[id] = url
+            }
+        }
+        // Includes other running apps that live outside those roots.
         for app in workspace.runningApplications where app.activationPolicy == .regular {
             if let id = app.bundleIdentifier, let url = app.bundleURL, urls[id] == nil { urls[id] = url }
         }

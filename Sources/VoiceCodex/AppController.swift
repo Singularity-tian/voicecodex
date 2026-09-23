@@ -13,6 +13,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let overlay = RecordingOverlay()
     private var speech: RealtimeSTT?
     private let macDriver = MacControlDriver()
+    private var speechVocabulary: SpeechVocabulary?
     private var macTask: Task<Void, Never>?
     private var macStatus = "等待语音指令"
     private var recordingTargetID: String?
@@ -101,6 +102,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
         view.configureMode(mac: isMacMode)
+        _ = refreshSpeechVocabulary()
         updateProject()
         loadHistory()
         updateState()
@@ -239,7 +241,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         return
                     }
                 }
-                try await service.start(apiKey: self.config.sonioxAPIKey)
+                try await service.start(apiKey: self.config.sonioxAPIKey, vocabularyProvider: { [weak self] in
+                    self?.refreshSpeechVocabulary() ?? SonioxConnection.defaultContext
+                })
                 guard self.recordingGeneration == generation else { service.cancel(); return }
                 self.recordingState = .recording
                 self.overlay.title.stringValue = "正在听 · 松手即执行"
@@ -801,6 +805,27 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         view.openTerminalButton.isEnabled = config.projectPath != nil && !submitting
     }
 
+    @discardableResult
+    private func refreshSpeechVocabulary() -> [String: Any] {
+        let vocabulary = SpeechVocabulary.build(applications: macDriver.applications(),
+                                                 currentApplicationID: macDriver.foregroundApplicationID)
+        speechVocabulary = vocabulary
+        updateSpeechLabel()
+        return vocabulary.context
+    }
+
+    private func updateSpeechLabel() {
+        if config.sonioxAPIKey.isEmpty {
+            view.providerLabel.stringValue = "SONIOX  /  等待配置"
+        } else {
+            view.providerLabel.stringValue = "SONIOX · 中文 / English · \(speechVocabulary?.terms.count ?? 0) 热词"
+        }
+        if let vocabulary = speechVocabulary {
+            view.providerLabel.toolTip = "已载入 \(vocabulary.includedApplicationCount) 个 App 的名称及常见中英文叫法。每次录音自动刷新，优先当前和正在运行的 App。" +
+                (vocabulary.omittedApplicationCount > 0 ? "词表已达到容量限制，另有 \(vocabulary.omittedApplicationCount) 个 App 未纳入。" : "")
+        }
+    }
+
     private func updateState() {
         guard view != nil else { return }
         let recording = recordingState == .starting || recordingState == .recording
@@ -817,7 +842,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         view.examplesButton.isEnabled = !executing
         view.permissionsButton.isEnabled = !executing
         updateMacTarget()
-        view.providerLabel.stringValue = config.sonioxAPIKey.isEmpty ? "SONIOX  /  等待配置" : "SONIOX  /  LIVE STT"
+        updateSpeechLabel()
         let state: String
         switch recordingState {
         case .starting: state = "正在连接"
