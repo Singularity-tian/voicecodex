@@ -121,6 +121,7 @@ public enum TerminalLauncher {
         trap 'exit 143' TERM
         printf '%s\\n' "$$" > "$voicecodex_started_file"
         unset SONIOX_API_KEY
+        unset TYPESAFE_API_KEY
         """
         if let authTokenFileURL {
             script += """

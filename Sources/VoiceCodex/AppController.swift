@@ -12,6 +12,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let hotkey = GlobalHotkey()
     private let overlay = RecordingOverlay()
     private var speech: RealtimeSTT?
+    private let macDriver = MacControlDriver()
+    private var macTask: Task<Void, Never>?
+    private var macStatus = "等待语音指令"
+    private var recordingTargetID: String?
+    private var activationObserver: NSObjectProtocol?
+    private var confirmationAlert: NSAlert?
+    private var isMacMode: Bool { config.executionMode == "mac" }
     private var terminal: TerminalSession?
     private var terminalLaunch: TerminalLaunchFiles?
     private var monitorTask: Task<Void, Never>?
@@ -62,14 +69,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(editItem)
         NSApp.mainMenu = menu
 
-        view = MainView(frame: NSRect(x: 0, y: 0, width: 860, height: 780))
+        view = MainView(frame: NSRect(x: 0, y: 0, width: 900, height: 850))
         window = NSWindow(contentRect: view.frame, styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
         window.title = "VoiceCodex"
         window.titlebarAppearsTransparent = true
         window.backgroundColor = Theme.background
         window.contentView = view
-        window.minSize = NSSize(width: 780, height: 760)
+        window.minSize = NSSize(width: 840, height: 830)
         window.isReleasedWhenClosed = false
         window.delegate = self
         window.center()
@@ -79,14 +86,23 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         view.shortcutLabel.stringValue = hotkey.label
         hotkey.onPress = { [weak self] in self?.beginRecording() }
         hotkey.onRelease = { [weak self] in self?.endRecording() }
-        hotkey.onEscape = { [weak self] in self?.cancelRecording() }
-        updateProject()
-        if let data = try? String(contentsOf: LocalConfig.directory.appendingPathComponent("session-history.txt"), encoding: .utf8), !data.isEmpty {
-            history = String(data.suffix(100_000))
-            view.results.string = history
-            view.results.textColor = Theme.ink
-            view.results.scrollToEndOfDocument(nil)
+        hotkey.onEscape = { [weak self] in
+            guard let self else { return }
+            if self.isMacMode && self.executing { self.stopExecution() }
+            else { self.cancelRecording() }
         }
+        macDriver.captureForegroundApplication()
+        activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.macDriver.captureForegroundApplication()
+                self?.updateMacTarget()
+            }
+        }
+        view.configureMode(mac: isMacMode)
+        updateProject()
+        loadHistory()
         updateState()
         showWindow()
         if !lastError.isEmpty { appendHistory("系统", lastError) }
@@ -101,12 +117,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                  (view.stopButton, #selector(stopExecution)),
                                  (view.openWorktreeButton, #selector(openWorktree)),
                                  (view.openTerminalButton, #selector(openTerminal)),
+                                 (view.permissionsButton, #selector(enableAccessibility)),
+                                 (view.environmentButton, #selector(openEnvironment)),
+                                 (view.examplesButton, #selector(fillExample)),
                                  (view.sendButton, #selector(sendTypedCommand))] {
             button.target = self
             button.action = action
         }
         view.commandField.target = self
         view.commandField.action = #selector(sendTypedCommand)
+        view.modeSelector.target = self
+        view.modeSelector.action = #selector(changeMode)
     }
 
     private func setupMenuBar() {
@@ -146,14 +167,28 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         false
     }
 
+    func applicationDidBecomeActive(_ notification: Notification) {
+        guard !executing else { return }
+        config.reloadCredentials()
+        updateState()
+    }
+
     private func beginRecording() {
         guard recordingState == .idle, !choosingProject, !terminating else { return }
+        if isMacMode && executing { showToast(title: "正在执行", text: "完成当前动作后再说下一句；Esc 可停止。"); return }
+        config.reloadCredentials()
+        if let error = config.environmentError { showFailure(error); return }
+        if isMacMode && config.jevAPIKey.isEmpty { showFailure("请在 .env 填入 TYPESAFE_API_KEY，然后再次按住说话。"); return }
         guard !config.sonioxAPIKey.isEmpty else {
             showFailure("先在设置中填写 Soniox API key。")
             showSettings()
             return
         }
-        guard config.projectPath != nil else { chooseProject(); return }
+        if !isMacMode && config.projectPath == nil { chooseProject(); return }
+        if isMacMode {
+            macDriver.captureForegroundApplication()
+            recordingTargetID = macDriver.foregroundApplicationID
+        }
         overlayTimer?.invalidate()
         releaseRequested = false
         lastError = ""
@@ -245,8 +280,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     self.showToast(title: "没有听清", text: "请再次按住快捷键说话。")
                     self.updateState()
                 } else {
-                    self.enqueue(text)
-                    self.showToast(title: self.executing && !self.queue.isEmpty ? "指令已排队" : "已交给 Codex", text: text)
+                    if self.isMacMode { self.executeMac(text, target: self.recordingTargetID) }
+                    else { self.enqueue(text) }
+                    self.showToast(title: self.isMacMode ? "Jev 正在理解" : (self.executing && !self.queue.isEmpty ? "指令已排队" : "已交给 Codex"), text: text)
                 }
             } catch {
                 guard self.recordingGeneration == generation else { return }
@@ -273,15 +309,22 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func sendTypedCommand() {
         guard !choosingProject, !terminating else { return }
+        guard !isMacMode || !executing else { return }
+        guard !isMacMode || recordingState == .idle else { return }
         let text = view.commandField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
-        guard config.projectPath != nil else { chooseProject(); return }
+        if !isMacMode && config.projectPath == nil { chooseProject(); return }
         view.commandField.stringValue = ""
         view.showTranscript(text, active: false)
         enqueue(text)
     }
 
     private func enqueue(_ text: String) {
+        if isMacMode {
+            macDriver.captureForegroundApplication()
+            executeMac(text, target: macDriver.foregroundApplicationID)
+            return
+        }
         if !(deliveryPaused && queue.first?.text == text) {
             queue.append(PendingPrompt(text: text))
             appendHistory("你", text)
@@ -290,6 +333,158 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         lastError = ""
         updateState()
         executeNext()
+    }
+
+    private func executeMac(_ text: String, target: String?) {
+        guard !executing else { return }
+        config.reloadCredentials()
+        if let error = config.environmentError { showFailure(error); return }
+        guard !config.jevAPIKey.isEmpty else {
+            showFailure("请在 .env 填入 TYPESAFE_API_KEY。保存后可直接重试，无需重启。")
+            return
+        }
+        let applications = macDriver.applications()
+        let client = JevClient(apiKey: config.jevAPIKey, model: config.jevModel)
+        executing = true
+        lastError = ""
+        macStatus = "Jev 正在选择动作…"
+        appendHistory("你", text)
+        hotkey.captureEscape(true)
+        updateState()
+        macTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                self.executing = false
+                self.macTask = nil
+                self.hotkey.captureEscape(false)
+                self.updateState()
+            }
+            do {
+                let command = try await client.plan(transcript: text, applications: applications, currentApplicationID: target)
+                try Task.checkCancellation()
+                guard command.intent != .unsupported else { throw JevClientError.unsupportedCommand }
+                let appName = applications.first { $0.id == command.applicationID }?.name ?? "当前应用"
+                let description = "\(self.actionName(command.intent)) · \(appName)"
+                self.macStatus = description
+                self.appendHistory("Jev", description)
+                if self.macDriver.needsAccessibility(for: command.intent), !self.macDriver.accessibilityGranted {
+                    throw DemoError.message("需要辅助功能权限来执行这个动作。点击「启用辅助功能」，在系统设置中允许 VoiceCodex 后重试。")
+                }
+                if self.macDriver.requiresConfirmation(command) {
+                    guard await self.confirmMacAction(command, description: description) else {
+                        throw CancellationError()
+                    }
+                }
+                try Task.checkCancellation()
+                let receipt = try await self.macDriver.execute(command: command, goal: text, jev: client)
+                try Task.checkCancellation()
+                self.appendHistory("Mac", receipt)
+                self.macStatus = "动作已结束 · 可以继续说话"
+                self.showToast(title: "动作已结束", text: receipt)
+            } catch is CancellationError {
+                self.macStatus = "已停止"
+                self.appendHistory("系统", "已停止后续操作。已执行的动作不会自动撤销。")
+            } catch {
+                self.macStatus = "动作未完成"
+                self.showFailure(error.localizedDescription)
+            }
+        }
+    }
+
+    private func confirmMacAction(_ command: MacCommand, description: String) async -> Bool {
+        let alert = NSAlert()
+        alert.messageText = description
+        alert.informativeText = "此动作可能关闭窗口或提交当前应用中的内容。请确认目标和当前界面。" + (command.text.map { "\n文字：\($0)" } ?? "")
+        alert.addButton(withTitle: "执行")
+        alert.addButton(withTitle: "取消")
+        confirmationAlert = alert
+        showWindow()
+        updateState()
+        let response = await withCheckedContinuation { continuation in
+            alert.beginSheetModal(for: window) { continuation.resume(returning: $0) }
+        }
+        confirmationAlert = nil
+        updateState()
+        return response == .alertFirstButtonReturn && !Task.isCancelled
+    }
+
+    private func actionName(_ intent: MacIntent) -> String {
+        switch intent {
+        case .openApp: return "打开应用"
+        case .newTab: return "新建标签页"
+        case .newWindow: return "新建窗口 / 文稿"
+        case .closeWindow: return "关闭窗口"
+        case .closeAllWindows: return "关闭全部窗口"
+        case .typeText: return "输入原文"
+        case .pressReturn: return "按回车"
+        case .copy: return "复制"
+        case .paste: return "粘贴"
+        case .undo: return "撤销"
+        case .scrollDown: return "向下滚动"
+        case .scrollUp: return "向上滚动"
+        case .clickElement: return "点击控件"
+        case .unsupported: return "暂不支持"
+        }
+    }
+
+    @objc private func changeMode() {
+        guard !executing, recordingState == .idle else { return }
+        persistHistory()
+        config.executionMode = view.modeSelector.selectedSegment == 0 ? "mac" : "codex"
+        executing = isMacMode ? (macTask != nil) : (submitting || terminalActive)
+        do { try config.save() } catch { showFailure(error.localizedDescription); return }
+        lastError = ""
+        view.configureMode(mac: isMacMode)
+        loadHistory()
+        updateProject()
+        updateState()
+    }
+
+    @objc private func enableAccessibility() {
+        macDriver.requestAccessibility()
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+    }
+
+    @objc private func openEnvironment() {
+        let file = config.envFile
+        if !FileManager.default.fileExists(atPath: file.path) {
+            do {
+                try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                                        attributes: [.posixPermissions: 0o700])
+                let template = "TYPESAFE_API_KEY=\nTYPESAFE_DEFAULT_MODEL=jev-1.13.0\nSONIOX_API_KEY=\n"
+                try template.write(to: file, atomically: true, encoding: .utf8)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+            } catch { showFailure(error.localizedDescription); return }
+        }
+        NSWorkspace.shared.open(file)
+    }
+
+    @objc private func fillExample() {
+        view.commandField.stringValue = "在 Chrome 新建一个标签页"
+        window.makeFirstResponder(view.commandField)
+    }
+
+    private func updateMacTarget() {
+        guard view != nil, isMacMode else { return }
+        let name = macDriver.foregroundApplicationID.flatMap {
+            NSRunningApplication.runningApplications(withBundleIdentifier: $0).first?.localizedName
+        }
+        view.macTargetLabel.stringValue = name.map { "当前应用：\($0)" } ?? "此 Mac · 说出应用名称"
+        view.permissionsButton.title = macDriver.accessibilityGranted ? "辅助功能已开启 ✓" : "启用辅助功能"
+    }
+
+    private var historyFile: URL {
+        LocalConfig.directory.appendingPathComponent(isMacMode ? "mac-history.txt" : "session-history.txt")
+    }
+
+    private func loadHistory() {
+        history = (try? String(contentsOf: historyFile, encoding: .utf8)).map { String($0.suffix(100_000)) } ?? ""
+        view.results.string = history.isEmpty ? (isMacMode ?
+            "从一句简单指令开始。\n\n「打开 Chrome」　「新建一个标签页」\n「打开便笺」　「输入『hello world』」\n\n每次说一个动作。这里会显示 Jev 的选择和 Mac 的实际执行结果。" :
+            "语音和文字指令会发送到 Terminal 中的 Codex 会话。") : history
+        view.results.textColor = history.isEmpty ? Theme.muted : Theme.ink
+        view.results.scrollToEndOfDocument(nil)
+        view.showTranscript(isMacMode ? "试着说：在 Chrome 新建一个标签页。" : "试着说：帮我看看这个项目。", active: false)
     }
 
     private func executeNext() {
@@ -440,7 +635,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             while !Task.isCancelled {
                 guard let self else { return }
                 if !self.terminalIsOpen {
-                    self.appendHistory("Terminal", "终端会话已关闭。再次说话会恢复这个会话。")
+                    self.appendTerminalHistory("终端会话已关闭。再次说话会恢复这个会话。")
                     self.closeTerminalConnection()
                     self.updateState()
                     return
@@ -453,14 +648,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     if self.deliveryGeneration != generation { continue }
                     self.terminalActive = state.isActive
                     self.waitingForApproval = state.waitingForApproval
-                    self.executing = self.submitting || state.isActive
+                    if !self.isMacMode { self.executing = self.submitting || state.isActive }
                     self.updateState()
                     try await Task.sleep(nanoseconds: 1_000_000_000)
                 } catch is CancellationError { return }
                 catch {
                     guard !Task.isCancelled, self.terminal === connection else { return }
                     self.closeTerminalConnection()
-                    self.showFailure("Terminal 连接已断开：" + error.localizedDescription)
+                    if self.isMacMode { self.appendTerminalHistory("Terminal 连接已断开。切回编程模式后可重新连接。") }
+                    else { self.showFailure("Terminal 连接已断开：" + error.localizedDescription) }
                     return
                 }
             }
@@ -475,7 +671,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         terminalLaunch = nil
         terminalActive = false
         waitingForApproval = false
-        executing = submitting
+        if !isMacMode { executing = submitting }
     }
 
     @objc private func openTerminal() {
@@ -508,6 +704,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func stopExecution() {
+        if isMacMode {
+            macTask?.cancel()
+            if let alert = confirmationAlert { window.endSheet(alert.window, returnCode: .cancel) }
+            if recordingState != .idle { cancelRecording() }
+            macStatus = executing ? "正在停止…" : "已停止"
+            updateState()
+            return
+        }
         queue.removeAll()
         if recordingState != .idle { cancelRecording() }
         runTask?.cancel()
@@ -549,6 +753,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func newTask() {
         guard !executing, recordingState == .idle else { showToast(title: "任务进行中", text: "结束当前任务后再创建新任务。"); return }
+        if isMacMode {
+            history = ""
+            persistHistory()
+            loadHistory()
+            lastError = ""
+            updateState()
+            return
+        }
         resetSession()
     }
 
@@ -583,6 +795,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func updateState() {
+        guard view != nil else { return }
         let recording = recordingState == .starting || recordingState == .recording
         view.level.active = recording
         overlay.level.active = recording
@@ -591,6 +804,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         view.openTerminalButton.isEnabled = config.projectPath != nil && !submitting
         view.newTaskButton.isEnabled = !executing && recordingState == .idle
         view.projectButton.isEnabled = !executing && recordingState == .idle
+        view.modeSelector.isEnabled = !executing && recordingState == .idle
+        view.sendButton.isEnabled = !isMacMode || (!executing && recordingState == .idle)
+        view.recordButton.isEnabled = !isMacMode || !executing
+        view.examplesButton.isEnabled = !executing
+        view.permissionsButton.isEnabled = !executing
+        updateMacTarget()
         view.providerLabel.stringValue = config.sonioxAPIKey.isEmpty ? "SONIOX  /  等待配置" : "SONIOX  /  LIVE STT"
         let state: String
         switch recordingState {
@@ -598,12 +817,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         case .recording: state = "正在听"
         case .finishing: state = "正在转写"
         case .idle:
-            state = executing ? (waitingForApproval ? "请在终端确认" : (submitting ? "正在发送" : "终端执行中")) :
-                (!lastError.isEmpty ? "需要留意" : (config.sonioxAPIKey.isEmpty ? "等待配置" : "准备就绪"))
+            if isMacMode {
+                state = executing ? (confirmationAlert == nil ? "正在执行" : "等待确认") : (!lastError.isEmpty ? "需要留意" : (config.jevAPIKey.isEmpty ? "等待 Jev key" : "准备就绪"))
+            } else {
+                state = executing ? (waitingForApproval ? "请在终端确认" : (submitting ? "正在发送" : "终端执行中")) :
+                    (!lastError.isEmpty ? "需要留意" : (config.sonioxAPIKey.isEmpty ? "等待配置" : "准备就绪"))
+            }
         }
         view.stateLabel.stringValue = "●  " + state
         view.stateLabel.textColor = !lastError.isEmpty && recordingState == .idle ? .systemOrange : Theme.green
-        if !submitting {
+        if isMacMode {
+            view.taskLabel.stringValue = macStatus
+        } else if !submitting {
             view.taskLabel.stringValue = waitingForApproval ? "请在终端确认" :
                 (terminalActive ? "Codex 正在终端执行…" : (terminalIsOpen ? "终端已连接 · 可以继续说话" : "等待打开终端"))
         }
@@ -621,10 +846,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         persistHistory()
     }
 
+    private func appendTerminalHistory(_ text: String) {
+        guard isMacMode else { appendHistory("Terminal", text); return }
+        let file = LocalConfig.directory.appendingPathComponent("session-history.txt")
+        let previous = (try? String(contentsOf: file, encoding: .utf8)) ?? ""
+        let time = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short)
+        let next = String((previous + "\n\nTerminal · \(time)\n" + text).suffix(100_000))
+        try? next.write(to: file, atomically: true, encoding: .utf8)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+    }
+
     private func persistHistory() {
         try? FileManager.default.createDirectory(at: LocalConfig.directory, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
-        let file = LocalConfig.directory.appendingPathComponent("session-history.txt")
+        let file = historyFile
         try? history.write(to: file, atomically: true, encoding: .utf8)
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
     }
@@ -632,7 +867,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func showFailure(_ message: String) {
         // Provider credentials are never included in visible errors, even if a
         // library unexpectedly echoes a request in its error description.
-        let safe = config.sonioxAPIKey.isEmpty ? message : message.replacingOccurrences(of: config.sonioxAPIKey, with: "[redacted]")
+        let safe = [config.sonioxAPIKey, config.jevAPIKey].filter { !$0.isEmpty }.reduce(message) {
+            $0.replacingOccurrences(of: $1, with: "[redacted]")
+        }
         lastError = String(safe.prefix(1600))
         appendHistory("出错了", lastError)
         updateState()
@@ -654,8 +891,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func showSettings() {
+        config.reloadCredentials()
         if let settingsWindow { settingsWindow.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
-        let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 320),
+        let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 380),
                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
         panel.title = "VoiceCodex 设置"
         panel.isReleasedWhenClosed = false
@@ -669,7 +907,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let save = NSButton(title: "保存", target: self, action: #selector(saveSettings))
         save.bezelStyle = .rounded
         save.keyEquivalent = "\r"
-        let content = vstack([textLabel("云端实时转写", size: 20, weight: .semibold),
+        let envButton = NSButton(title: "打开 Jev 的 .env", target: self, action: #selector(openEnvironment))
+        envButton.bezelStyle = .rounded
+        let jevLabel = textLabel(config.jevAPIKey.isEmpty ? "Jev：等待 TYPESAFE_API_KEY" : "Jev：已配置 · \(config.jevModel)", size: 12, color: Theme.muted)
+        let content = vstack([textLabel("语音与执行", size: 20, weight: .semibold),
+                              hstack([jevLabel, spacer(), envButton]),
                               textLabel("Soniox API key", size: 12, weight: .medium), keyField,
                               textLabel("Codex CLI 路径", size: 12, weight: .medium), pathField,
                               textLabel("凭证保存在本机 Application Support，文件权限为 600。", size: 11, color: Theme.muted),
@@ -688,6 +930,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if let path = executableField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) { config.codexPath = path }
         do {
             try config.save()
+            config.reloadCredentials()
             apiKeyField?.stringValue = ""
             settingsWindow?.close()
             settingsWindow = nil
@@ -701,16 +944,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if recordingState != .idle || executing {
             let alert = NSAlert()
             alert.messageText = "退出并停止当前任务？"
-            alert.informativeText = "当前录音与本应用打开的 Codex 终端连接会停止。工作目录和会话会保留。"
+            alert.informativeText = isMacMode ? "当前录音和后续 Mac 操作会停止；已经完成的动作会保留。" : "当前录音与本应用打开的 Codex 终端连接会停止。工作目录和会话会保留。"
             alert.addButton(withTitle: "退出")
             alert.addButton(withTitle: "继续运行")
             if alert.runModal() != .alertFirstButtonReturn { return .terminateCancel }
         }
         speech?.cancel()
+        macTask?.cancel()
+        if let alert = confirmationAlert { window.endSheet(alert.window, returnCode: .cancel) }
         closeTerminalConnection()
         runTask?.cancel()
         hotkey.unregister()
-        if let pending = runTask {
+        if let pending = macTask ?? runTask {
             terminating = true
             Task {
                 await pending.value

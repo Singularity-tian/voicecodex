@@ -46,6 +46,7 @@ public final class CodexRunner: @unchecked Sendable {
         self.executableURL = executableURL
         var childEnvironment = environment
         childEnvironment.removeValue(forKey: "SONIOX_API_KEY")
+        childEnvironment.removeValue(forKey: "TYPESAFE_API_KEY")
         self.environment = childEnvironment
     }
 
