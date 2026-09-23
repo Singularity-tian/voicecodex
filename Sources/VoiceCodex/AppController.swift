@@ -370,13 +370,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 if self.macDriver.needsAccessibility(for: command.intent), !self.macDriver.accessibilityGranted {
                     throw DemoError.message("需要辅助功能权限来执行这个动作。点击「启用辅助功能」，在系统设置中允许 VoiceCodex 后重试。")
                 }
+                var confirmationContext: MacControlDriver.ConfirmationContext?
                 if self.macDriver.requiresConfirmation(command) {
+                    confirmationContext = try self.macDriver.captureConfirmationContext(command: command)
                     guard await self.confirmMacAction(command, description: description) else {
                         throw CancellationError()
                     }
                 }
                 try Task.checkCancellation()
-                let receipt = try await self.macDriver.execute(command: command, goal: text, jev: client)
+                let receipt = try await self.macDriver.execute(command: command, goal: text, jev: client, context: confirmationContext)
                 try Task.checkCancellation()
                 self.appendHistory("Mac", receipt)
                 self.macStatus = "动作已结束 · 可以继续说话"
@@ -412,6 +414,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         switch intent {
         case .openApp: return "打开应用"
         case .newTab: return "新建标签页"
+        case .closeTab: return "关闭当前标签页"
         case .newWindow: return "新建窗口 / 文稿"
         case .closeWindow: return "关闭窗口"
         case .closeAllWindows: return "关闭全部窗口"
@@ -675,7 +678,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func openTerminal() {
-        guard !submitting, !choosingProject, !terminating else { return }
+        guard !isMacMode, !submitting, !choosingProject, !terminating else { return }
         if terminalIsOpen {
             if deliveryPaused && !queue.isEmpty { executeNext() }
             NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Terminal").first?
@@ -730,7 +733,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func chooseProject() {
         guard !choosingProject else { return }
-        guard !executing, recordingState == .idle else { showToast(title: "任务进行中", text: "结束当前任务后再切换项目。"); return }
+        guard !executing, !submitting, !terminalActive, recordingState == .idle else {
+            showToast(title: "任务进行中", text: "结束当前任务后再切换项目。")
+            return
+        }
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
@@ -744,7 +750,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 guard let self else { return }
                 self.choosingProject = false
                 guard response == .OK, let url = panel.url,
-                      !self.executing, self.recordingState == .idle else { return }
+                      !self.executing, !self.submitting, !self.terminalActive,
+                      self.recordingState == .idle else { return }
                 self.config.projectPath = url.path
                 self.resetSession()
             }

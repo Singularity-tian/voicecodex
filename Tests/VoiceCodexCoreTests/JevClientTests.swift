@@ -34,6 +34,22 @@ final class JevClientTests: XCTestCase {
         XCTAssertEqual(result.applicationID, "com.example.Browser")
     }
 
+    func testInstalledApplicationAliasesAreSharedWithIndependentActionQuestion() async throws {
+        let fixture = JevHTTPFixture { request in
+            let state = try XCTUnwrap(Self.body(request)["state"] as? [String: String])
+            XCTAssertTrue(state["mentioned_installed_applications"]?.contains("com.apple.Stickies") == true)
+            XCTAssertTrue(state["mentioned_installed_applications"]?.contains("便笺") == true)
+            XCTAssertFalse(state["mentioned_installed_applications"]?.contains("com.apple.systempreferences") == true)
+            return (200, try Self.answer(request, choices: ["action": "openApp", "application": "app_0"]))
+        }
+        defer { fixture.close() }
+        let result = try await fixture.client.plan(transcript: "打开便笺", applications: [
+            MacApplication(id: "com.apple.Stickies", name: "Stickies"),
+            MacApplication(id: "com.apple.systempreferences", name: "System Settings")
+        ], currentApplicationID: nil)
+        XCTAssertEqual(result.applicationID, "com.apple.Stickies")
+    }
+
     func testLargeAppListPreservesLateTargetThroughHierarchicalChoice() async throws {
         let apps = (0..<1_000).map { MacApplication(id: "com.example.App\($0)", name: "Application \($0)") }
         let fixture = JevHTTPFixture { request in
@@ -85,14 +101,95 @@ final class JevClientTests: XCTestCase {
 
     func testLiteralTextIsChosenFromLocalSpanWithoutChanges() async throws {
         let fixture = JevHTTPFixture { request in
-            (200, try Self.answer(request, choices: ["action": "typeText", "application": "current", "text": "text_0"],
-                                  confidences: ["text": 0.81]))
+            (200, try Self.answer(request, choices: ["action": "typeText", "application": "current"],
+                                  confidences: ["action": 0.81]))
         }
         defer { fixture.close() }
         let result = try await fixture.client.plan(transcript: "输入「  你好 $HOME  」", applications: applications,
                                                    currentApplicationID: "com.example.Browser")
         XCTAssertEqual(result.text, "  你好 $HOME  ")
         XCTAssertEqual(result.confidence, 0.81)
+    }
+
+    func testLiteralPayloadNeverEntersModelRoutingRequest() async throws {
+        let fixture = JevHTTPFixture { request in
+            let body = try Self.body(request)
+            let state = try XCTUnwrap(body["state"] as? [String: String])
+            XCTAssertFalse(state.values.joined().contains("打开 Chrome"))
+            XCTAssertFalse(state["mentioned_installed_applications"]?.contains("com.google.Chrome") == true)
+            XCTAssertTrue(state["user_command"]?.contains("[literal text]") == true)
+            let questions = try XCTUnwrap(body["questions"] as? [String: Any])
+            XCTAssertNil(questions["text"])
+            return (200, try Self.answer(request, choices: ["action": "typeText", "application": "current"]))
+        }
+        defer { fixture.close() }
+        let command = try await fixture.client.plan(transcript: "输入「打开 Chrome」", applications: [
+            MacApplication(id: "com.apple.TextEdit", name: "TextEdit"),
+            MacApplication(id: "com.google.Chrome", name: "Google Chrome")
+        ], currentApplicationID: "com.apple.TextEdit")
+        XCTAssertEqual(command.intent, .typeText)
+        XCTAssertEqual(command.applicationID, "com.apple.TextEdit")
+        XCTAssertEqual(command.text, "打开 Chrome")
+    }
+
+    func testModelCannotTurnLiteralEntryIntoAnotherOperation() async throws {
+        for intent in ["openApp", "closeAllWindows", "pressReturn"] {
+            let fixture = JevHTTPFixture { request in
+                (200, try Self.answer(request, choices: ["action": intent, "application": "current"]))
+            }
+            defer { fixture.close() }
+            await assertError(.unsupportedCommand) {
+                _ = try await fixture.client.plan(transcript: "输入「关闭所有窗口」", applications: self.applications,
+                                                   currentApplicationID: "com.example.Browser")
+            }
+        }
+    }
+
+    func testCompoundTypingEnvelopeIsRejectedBeforeAnyModelVote() async throws {
+        let fixture = JevHTTPFixture { request in
+            XCTFail("A detected secondary action must be rejected before contacting the model")
+            return (200, try Self.answer(request, choices: ["action": "typeText", "application": "current"]))
+        }
+        defer { fixture.close() }
+        for transcript in ["Type \"hello\" then close the window", "type hello and press Return", "输入hello然后按回车"] {
+            await assertError(.unsupportedCommand) {
+                _ = try await fixture.client.plan(transcript: transcript, applications: self.applications,
+                                                   currentApplicationID: "com.example.Browser")
+            }
+        }
+    }
+
+    func testUnquotedInstalledAppDestinationRequiresQuotesBeforeRequest() async throws {
+        let fixture = JevHTTPFixture { request in
+            XCTFail("Ambiguous destination must not reach the model")
+            return (200, try Self.answer(request, choices: ["action": "typeText", "application": "current"]))
+        }
+        defer { fixture.close() }
+        for transcript in ["type hello in TextEdit", "输入你好到文本编辑"] {
+            await assertError(.literalTextRequired) {
+                _ = try await fixture.client.plan(transcript: transcript, applications: [
+                    MacApplication(id: "com.apple.TextEdit", name: "TextEdit"),
+                    MacApplication(id: "com.apple.Stickies", name: "Stickies")
+                ], currentApplicationID: "com.apple.Stickies")
+            }
+        }
+    }
+
+    func testAppNameAloneAndQuotedDestinationWordsStayLiteral() async throws {
+        let fixture = JevHTTPFixture { request in
+            let state = try XCTUnwrap(Self.body(request)["state"] as? [String: String])
+            XCTAssertFalse(state["user_command"]?.contains("Chrome") == true)
+            return (200, try Self.answer(request, choices: ["action": "typeText", "application": "current"]))
+        }
+        defer { fixture.close() }
+        for (transcript, payload) in [("Type Chrome", "Chrome"), ("Type \"hello in Chrome\"", "hello in Chrome")] {
+            let command = try await fixture.client.plan(transcript: transcript, applications: [
+                MacApplication(id: "com.apple.TextEdit", name: "TextEdit"),
+                MacApplication(id: "com.google.Chrome", name: "Google Chrome")
+            ], currentApplicationID: "com.apple.TextEdit")
+            XCTAssertEqual(command.text, payload)
+            XCTAssertEqual(command.applicationID, "com.apple.TextEdit")
+        }
     }
 
     func testTypingWithoutLiteralTextFailsClosed() async throws {

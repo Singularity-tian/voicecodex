@@ -22,15 +22,18 @@ Try these commands, one at a time:
 | --- | --- |
 | “打开 Chrome” / “Open Calculator” | Open or activate an installed app |
 | “在 Chrome 新建一个标签页” | Send ⌘T to Chrome |
+| “关闭当前标签页” | Close only the current browser tab with ⌘W |
 | “打开便笺” → “新建一个窗口” | Open Stickies, then create a note |
 | “输入「hello world」” / “Type hello world” | Insert your literal text at the focused editor's selection |
 | “向下滚动” / “复制” / “撤销” | Operate the captured target app |
 | “点击保存按钮” | Choose from observed, enabled Accessibility controls |
 | “关闭 Chrome 的所有窗口” | Review, then close observed windows; stop at a save dialog |
 
-Jev chooses from a fixed action vocabulary and observed app/control IDs. It does not generate prose, scripts, shell commands, or text to type. Say one operation per command; compound research/writing workflows are not implemented in Mac mode. Typing preserves the rest of an editable field and does not press Return. Protected fields and terminal input are blocked. Apps that do not expose usable Accessibility controls may need a manual click first.
+Jev chooses from a fixed action vocabulary and observed app/control IDs. It does not generate prose, scripts, shell commands, or text to type. Literal typing content is held locally and hidden from action selection, so saying “输入「打开 Chrome」” enters those words. Say one operation per command; compound research/writing workflows are not implemented in Mac mode. Typing preserves the rest of an editable field and does not press Return. Protected fields and terminal input are blocked. Apps that do not expose usable Accessibility controls may need a manual click first.
 
 The target for an unnamed app is captured when recording starts. Named apps can be selected explicitly. Return, paste, clicking a control, and closing all windows have an in-app review step. A cancellation stops later actions; it does not undo input already delivered. Receipts distinguish observed changes from shortcuts whose final effect cannot be verified.
+
+“关闭窗口” closes the whole window, including its tabs. Use “关闭当前标签页” for one tab. New-tab and new-window commands can launch a stopped target app. Confirmation binds to the selected process, window, and input field; changing them while reviewing stops the action.
 
 ### Local `.env`
 
@@ -95,7 +98,7 @@ You can also hold the **按住说话** button, or type a prompt in the bottom fi
 - Audio is captured only for an explicit recording and streamed to **Soniox**. VoiceCodex keeps audio in memory and does not save recordings.
 - The app waits for Soniox's final completion response. A network or transcription error does not execute a partial transcript.
 - Final text is sent to **Codex**, using the account and provider configuration already configured for your CLI.
-- In Mac mode, final text and app names/identifiers are sent to **TypeSafe**. A click command additionally sends bounded Accessibility role/title/description text for the selected window. Screenshots, clipboard contents, and whole documents are not sent to Jev. Transcripts and action receipts are saved privately in `mac-history.txt`, separately from the coding session history.
+- In Mac mode, the routing instruction and app names/identifiers are sent to **TypeSafe**. Recognized literal typing payloads are replaced with a placeholder and remain local during planning. A click command additionally sends bounded Accessibility role/title/description text for the selected window. Screenshots, clipboard contents, and whole documents are not sent to Jev. Transcripts and action receipts are saved privately in `mac-history.txt`, separately from the coding session history.
 - Settings, the Soniox credential, session IDs, and local transcript/output history live in `~/Library/Application Support/VoiceCodex/`. Config and history files use mode `0600`.
 - Task worktrees live under that directory's `worktrees/`. They are preserved when you start a new task; remove finished ones with `git worktree remove` when ready.
 - The Soniox key is used by the voice app and is not added to the Codex child-process environment. `SONIOX_API_KEY` is also supported for explicitly configured development launches.
@@ -115,6 +118,8 @@ swift test
 ```
 
 The Codex app's Run action calls `script/build_and_run.sh`. Other modes include `--logs`, `--telemetry`, and `--debug`.
+
+For opt-in real API checks and disposable desktop scenarios, see [the QA guide](docs/testing.md). Synthetic speech checks exercise Soniox finalization and Jev planning without recording the microphone or operating other apps.
 
 | Component | Responsibility |
 | --- | --- |
