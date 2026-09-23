@@ -1,9 +1,12 @@
 // Opt-in live integration check. Receives only fixed synthetic audio fixtures.
 // Run with script/test_speech_live.sh --live; no microphone or desktop input.
+// Add --vocabulary-ab for paired app-name context checks, or --filter FIXTURE_ID.
 // Offline configuration check: .build/qa/speech-live-check --check-config
 // A nonexistent VOICECODEX_ENV_FILE must make this check exit 2 before any request.
 import AVFoundation
+import CryptoKit
 import Foundation
+import VoiceCodexCore
 
 @main
 struct SpeechLiveCheck {
@@ -14,15 +17,17 @@ struct SpeechLiveCheck {
         let intent: MacIntent
         let current: String
         let acceptedText: [String]
+        let acceptedAppMentions: [String]
 
         init(id: String, phrase: String, target: String, intent: MacIntent = .openApp,
-             current: String = "com.apple.finder", acceptedText: [String] = []) {
+             current: String = "com.apple.finder", acceptedText: [String] = [], acceptedAppMentions: [String] = []) {
             self.id = id
             self.phrase = phrase
             self.target = target
             self.intent = intent
             self.current = current
             self.acceptedText = acceptedText
+            self.acceptedAppMentions = acceptedAppMentions
         }
 
         var expected: String {
@@ -33,10 +38,14 @@ struct SpeechLiveCheck {
 
     private struct Result: Codable {
         let id: String
+        let arm: String
         let phrase: String
         let transcript: String?
         let confirmedFinalCallback: Bool
+        let appNameRecognized: Bool?
+        let planMatched: Bool
         let passed: Bool
+        let audioSHA256: String
         let sourceSampleRate: Double?
         let pcmBytes: Int?
         let transcriptionMilliseconds: Int?
@@ -51,9 +60,36 @@ struct SpeechLiveCheck {
         let scope: String
         let sonioxModel: String
         let jevModel: String
+        let applicationCount: Int
+        let vocabularyIncludedApplications: Int?
+        let vocabularyOmittedApplications: Int?
+        let arms: [ArmSummary]
+        let skippedScenarioIDs: [String]
         let passed: Int
         let total: Int
         let results: [Result]
+    }
+
+    private struct Arm {
+        let id: String
+        let context: [String: Any]?
+
+        var termCount: Int { (context?["terms"] as? [String])?.count ?? legacyTerms.count }
+        var contextBytes: Int {
+            let value = context ?? ["terms": legacyTerms]
+            return (try? JSONSerialization.data(withJSONObject: value).count) ?? 0
+        }
+    }
+
+    private struct ArmSummary: Codable {
+        let id: String
+        let termCount: Int
+        let contextUTF8Bytes: Int
+        let finalTranscripts: Int
+        let recognizedAppNames: Int
+        let correctPlans: Int
+        let passed: Int
+        let total: Int
     }
 
     private struct Credentials {
@@ -77,11 +113,19 @@ struct SpeechLiveCheck {
         let chunks: [Data]
         let durationPerChunk: Double
         var byteCount: Int { chunks.reduce(0) { $0 + $1.count } }
+        var sha256: String {
+            var digest = SHA256()
+            for chunk in chunks { digest.update(data: chunk) }
+            return digest.finalize().map { String(format: "%02x", $0) }.joined()
+        }
     }
 
     private enum HarnessFailure: Error {
         case setup, invalidAudio, queueOverflow, speechTimeout
     }
+
+    // Freeze the historical baseline independently of future production defaults.
+    private static let legacyTerms = ["Codex", "GitHub", "README", "worktree", "Swift", "Persom"]
 
     private static let scenarios: [Scenario] = [
         .init(id: "en-calculator", phrase: "Open Calculator", target: "com.apple.calculator"),
@@ -103,6 +147,21 @@ struct SpeechLiveCheck {
         MacApplication(id: "com.apple.finder", name: "Finder")
     ]
 
+    // Only common public application names are synthesized. Missing applications
+    // are skipped; the user's full inventory is never written into the report.
+    private static let vocabularyScenarios: [Scenario] = [
+        .init(id: "vocab-chrome-en", phrase: "Open Google Chrome", target: "com.google.Chrome", acceptedAppMentions: ["Chrome", "谷歌浏览器"]),
+        .init(id: "vocab-chrome-mixed", phrase: "打开 Chrome", target: "com.google.Chrome", acceptedAppMentions: ["Chrome", "谷歌浏览器"]),
+        .init(id: "vocab-notes-en", phrase: "Open Apple Notes", target: "com.apple.Notes", acceptedAppMentions: ["Apple Notes", "Notes", "备忘录"]),
+        .init(id: "vocab-notes-zh", phrase: "打开备忘录", target: "com.apple.Notes", acceptedAppMentions: ["Apple Notes", "Notes", "备忘录"]),
+        .init(id: "vocab-stickies-en", phrase: "Open Stickies", target: "com.apple.Stickies", acceptedAppMentions: ["Stickies", "便笺", "便签"]),
+        .init(id: "vocab-stickies-zh", phrase: "打开便笺", target: "com.apple.Stickies", acceptedAppMentions: ["Stickies", "便笺", "便签"]),
+        .init(id: "vocab-vscode-en", phrase: "Open Visual Studio Code", target: "com.microsoft.VSCode", acceptedAppMentions: ["Visual Studio Code", "VS Code"]),
+        .init(id: "vocab-vscode-mixed", phrase: "打开 Visual Studio Code", target: "com.microsoft.VSCode", acceptedAppMentions: ["Visual Studio Code", "VS Code"]),
+        .init(id: "vocab-feishu-zh", phrase: "打开飞书", target: "com.electron.lark", acceptedAppMentions: ["飞书", "Feishu", "Lark"]),
+        .init(id: "vocab-wechat-zh", phrase: "打开微信", target: "com.tencent.xinWeChat", acceptedAppMentions: ["微信", "WeChat"])
+    ]
+
     @MainActor
     static func main() async {
         let checkConfiguration = CommandLine.arguments.contains("--check-config")
@@ -110,7 +169,17 @@ struct SpeechLiveCheck {
             print("Skipped: add --live to send synthetic audio to Soniox and make paid TypeSafe requests.")
             return
         }
-        let output = URL(fileURLWithPath: ".build/qa/speech-live-results.json")
+        let vocabularyAB = CommandLine.arguments.contains("--vocabulary-ab")
+        let filter: String?
+        if let index = CommandLine.arguments.firstIndex(of: "--filter") {
+            guard CommandLine.arguments.indices.contains(index + 1),
+                  (scenarios + vocabularyScenarios).contains(where: { $0.id == CommandLine.arguments[index + 1] }) else {
+                print("Unknown synthetic scenario filter. No requests made."); exit(2)
+            }
+            filter = CommandLine.arguments[index + 1]
+        } else { filter = nil }
+        let outputName = vocabularyAB ? "speech-vocabulary-ab" : "speech-live"
+        let output = URL(fileURLWithPath: ".build/qa/\(outputName)\(filter.map { "-" + $0 } ?? "")-results.json")
         do {
             let credentials = try loadCredentials()
             guard !credentials.soniox.isEmpty, !credentials.jev.isEmpty else {
@@ -121,6 +190,20 @@ struct SpeechLiveCheck {
                 print("Local credentials loaded. No requests made.")
                 return
             }
+            let inventory = vocabularyAB ? MacControlDriver().applications().filter { $0.id != "com.singularity.voicecodex" } : applications
+            let vocabulary = vocabularyAB ? SpeechVocabulary.build(applications: inventory, currentApplicationID: "com.apple.finder") : nil
+            let available = vocabularyAB ? vocabularyScenarios.filter { scenario in inventory.contains { $0.id == scenario.target } } : scenarios
+            let selected = filter.map { id in available.filter { $0.id == id } } ?? available
+            let skipped = vocabularyAB ? vocabularyScenarios.filter { scenario in !inventory.contains { $0.id == scenario.target } }.map(\.id) : []
+            guard !selected.isEmpty else { print("No installed application matches the public-name fixtures."); exit(2) }
+            let arms: [Arm]
+            if let vocabulary {
+                var baseline = vocabulary.context
+                baseline["terms"] = legacyTerms
+                arms = [Arm(id: "legacy-six", context: baseline), Arm(id: "application-vocabulary", context: vocabulary.context)]
+                print("A/B: \(selected.count) identical synthetic clips × 2 term sets; \(inventory.count) installed apps; no desktop actions.")
+                for arm in arms { print("\(arm.id): \(arm.termCount) terms, \(arm.contextBytes) context bytes") }
+            } else { arms = [Arm(id: "default", context: nil)] }
             let configuration = URLSessionConfiguration.ephemeral
             configuration.timeoutIntervalForRequest = 15
             configuration.timeoutIntervalForResource = 20
@@ -128,12 +211,19 @@ struct SpeechLiveCheck {
             defer { session.invalidateAndCancel() }
             let jev = JevClient(apiKey: credentials.jev, model: credentials.model, session: session)
             var results: [Result] = []
-            for scenario in scenarios {
-                let result = await run(scenario, credentials: credentials, jev: jev)
-                results.append(result)
-                print("\(result.passed ? "PASS" : "FAIL") \(result.id): \(result.observed)")
-                fflush(stdout)
-                try save(results, model: credentials.model, to: output)
+            for (index, scenario) in selected.enumerated() {
+                // Decode and convert exactly once, then reuse the same PCM bytes
+                // for both arms. Alternate order to reduce sequential order bias.
+                let audio = try loadAudio(URL(fileURLWithPath: ".build/qa/speech-live-audio/\(scenario.id).aiff"))
+                let orderedArms = index.isMultiple(of: 2) ? arms : Array(arms.reversed())
+                for arm in orderedArms {
+                    let result = await run(scenario, audio: audio, arm: arm, applications: inventory, credentials: credentials, jev: jev)
+                    results.append(result)
+                    print("\(result.passed ? "PASS" : "FAIL") \(result.id) [\(result.arm)]: \(result.observed)")
+                    fflush(stdout)
+                    try save(results, model: credentials.model, applications: inventory.count, vocabulary: vocabulary,
+                             arms: arms, skipped: skipped, to: output)
+                }
             }
             let passed = results.filter(\.passed).count
             print("Synthetic speech → live Soniox → live Jev: \(passed)/\(results.count) passed.")
@@ -141,13 +231,14 @@ struct SpeechLiveCheck {
             exit(passed == results.count ? 0 : 1)
         } catch {
             // Do not print arbitrary errors, credentials, config contents, or private paths.
-            print("Could not read the local credentials or save the synthetic test report.")
+            print("Could not read local credentials or synthetic fixtures, or save the test report.")
             exit(2)
         }
     }
 
     @MainActor
-    private static func run(_ scenario: Scenario, credentials: Credentials, jev: JevClient) async -> Result {
+    private static func run(_ scenario: Scenario, audio: AudioFixture, arm: Arm, applications: [MacApplication],
+                            credentials: Credentials, jev: JevClient) async -> Result {
         var transcript: String?
         var finalCallback = false
         var sourceRate: Double?
@@ -155,11 +246,10 @@ struct SpeechLiveCheck {
         var sttMilliseconds: Int?
         var planMilliseconds: Int?
         var stage = "audio"
+        var recognized: Bool?
         let connection = SonioxConnection()
         defer { connection.cancel() }
         do {
-            let audioURL = URL(fileURLWithPath: ".build/qa/speech-live-audio/\(scenario.id).aiff")
-            let audio = try loadAudio(audioURL)
             sourceRate = audio.sampleRate
             pcmBytes = audio.byteCount
             connection.onTranscript = { _, final in if final { finalCallback = true } }
@@ -176,7 +266,7 @@ struct SpeechLiveCheck {
             // Exercise buffers captured while the production WebSocket is connecting.
             let prebuffered = min(3, audio.chunks.count)
             for chunk in audio.chunks.prefix(prebuffered) { try yield(chunk, into: connection) }
-            try await connection.start(apiKey: credentials.soniox)
+            try await connection.start(apiKey: credentials.soniox, context: arm.context)
             for chunk in audio.chunks.dropFirst(prebuffered) {
                 if timedOut { throw HarnessFailure.speechTimeout }
                 try Task.checkCancellation()
@@ -189,6 +279,10 @@ struct SpeechLiveCheck {
             deadline.cancel()
             sttMilliseconds = Int(Date().timeIntervalSince(started) * 1_000)
             guard let transcript, !transcript.isEmpty, finalCallback else { throw HarnessFailure.invalidAudio }
+            if !scenario.acceptedAppMentions.isEmpty {
+                let normalized = normalizeAppName(transcript)
+                recognized = scenario.acceptedAppMentions.contains { normalized.contains(normalizeAppName($0)) }
+            }
             stage = "planning"
             let planStarted = Date()
             let command = try await jev.plan(transcript: transcript, applications: applications,
@@ -196,21 +290,30 @@ struct SpeechLiveCheck {
             planMilliseconds = Int(Date().timeIntervalSince(planStarted) * 1_000)
             let textMatches = scenario.acceptedText.isEmpty ? command.text == nil :
                 command.text.map { scenario.acceptedText.contains($0) } == true
-            let passed = command.intent == scenario.intent && command.applicationID == scenario.target && textMatches
-            return Result(id: scenario.id, phrase: scenario.phrase, transcript: transcript,
-                          confirmedFinalCallback: finalCallback, passed: passed, sourceSampleRate: sourceRate,
+            let planMatched = command.intent == scenario.intent && command.applicationID == scenario.target && textMatches
+            let passed = planMatched && recognized != false
+            let publicIDs = Set((scenarios + vocabularyScenarios).map(\.target))
+            let observedTarget = command.applicationID.map { publicIDs.contains($0) ? $0 : "other installed application" } ?? "none"
+            return Result(id: scenario.id, arm: arm.id, phrase: scenario.phrase, transcript: transcript,
+                          confirmedFinalCallback: finalCallback, appNameRecognized: recognized, planMatched: planMatched,
+                          passed: passed, audioSHA256: audio.sha256, sourceSampleRate: sourceRate,
                           pcmBytes: pcmBytes, transcriptionMilliseconds: sttMilliseconds,
                           planningMilliseconds: planMilliseconds, expected: scenario.expected,
-                          observed: "\(command.intent.rawValue) → \(command.applicationID ?? "none")" +
+                          observed: "\(command.intent.rawValue) → \(observedTarget)" +
                             (command.text.map { " text=\($0.debugDescription)" } ?? ""),
                           confidence: command.confidence)
         } catch {
-            return Result(id: scenario.id, phrase: scenario.phrase, transcript: transcript,
-                          confirmedFinalCallback: finalCallback, passed: false, sourceSampleRate: sourceRate,
+            return Result(id: scenario.id, arm: arm.id, phrase: scenario.phrase, transcript: transcript,
+                          confirmedFinalCallback: finalCallback, appNameRecognized: recognized, planMatched: false,
+                          passed: false, audioSHA256: audio.sha256, sourceSampleRate: sourceRate,
                           pcmBytes: pcmBytes, transcriptionMilliseconds: sttMilliseconds,
                           planningMilliseconds: planMilliseconds, expected: scenario.expected,
                           observed: "\(stage): \(safeError(error))", confidence: nil)
         }
+    }
+
+    private static func normalizeAppName(_ text: String) -> String {
+        String(text.lowercased().unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) })
     }
 
     @MainActor
@@ -294,10 +397,23 @@ struct SpeechLiveCheck {
     }
 
     @MainActor
-    private static func save(_ results: [Result], model: String, to output: URL) throws {
+    private static func save(_ results: [Result], model: String, applications: Int, vocabulary: SpeechVocabulary?,
+                             arms: [Arm], skipped: [String], to output: URL) throws {
+        let summaries = arms.map { arm in
+            let rows = results.filter { $0.arm == arm.id }
+            return ArmSummary(id: arm.id, termCount: arm.termCount, contextUTF8Bytes: arm.contextBytes,
+                              finalTranscripts: rows.filter(\.confirmedFinalCallback).count,
+                              recognizedAppNames: rows.filter { $0.appNameRecognized == true }.count,
+                              correctPlans: rows.filter(\.planMatched).count,
+                              passed: rows.filter(\.passed).count, total: rows.count)
+        }
         let report = Report(generatedAt: ISO8601DateFormatter().string(from: Date()),
-                            scope: "Synthetic macOS say audio; production PCM encoding and Soniox WebSocket finalization; live Jev planning. No microphone, hotkey, AX or desktop execution.",
+                            scope: "Synthetic macOS say audio; production PCM encoding and Soniox finalization; live Jev planning. " +
+                                (vocabulary == nil ? "" : "Vocabulary A/B uses identical PCM and the same general context, changing only legacy-six versus application terms. ") +
+                                "No microphone, hotkey, AX or desktop execution; no claim of real microphone accuracy.",
                             sonioxModel: SonioxConnection.model, jevModel: model,
+                            applicationCount: applications, vocabularyIncludedApplications: vocabulary?.includedApplicationCount,
+                            vocabularyOmittedApplications: vocabulary?.omittedApplicationCount, arms: summaries, skippedScenarioIDs: skipped,
                             passed: results.filter(\.passed).count, total: results.count, results: results)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

@@ -1,7 +1,8 @@
 // Read-only live planner regression check. Requires an explicit --live flag.
 // Compile from the repository root (no package import or desktop automation):
 // swiftc Sources/VoiceCodexCore/EnvironmentFile.swift Sources/VoiceCodexCore/MacCommand.swift \
-//   Sources/VoiceCodexCore/JevClient.swift script/jev_live_check.swift -o .build/jev-live-check
+//   Sources/VoiceCodexCore/SpeechVocabulary.swift Sources/VoiceCodexCore/JevClient.swift \
+//   script/jev_live_check.swift -o .build/jev-live-check
 // .build/jev-live-check --live [--installed-apps] [--filter case-id] [--output .build/qa/jev-live-results.json]
 import Foundation
 import AppKit
