@@ -155,7 +155,7 @@ final class MacControlDriver {
 
     /// Snapshot the selected app before VoiceCodex shows its confirmation sheet.
     /// No app activation or text values are needed for this identity check.
-    func captureConfirmationContext(command: MacCommand) throws -> ConfirmationContext {
+    func captureConfirmationContext(command: MacCommand) async throws -> ConfirmationContext {
         try Task.checkCancellation()
         guard accessibilityGranted else { throw MacControlError.accessibilityRequired }
         guard let id = command.applicationID ?? foregroundApplicationID else { throw MacControlError.noTarget }
@@ -166,7 +166,7 @@ final class MacControlDriver {
         guard let window = elementAttribute(ax, kAXFocusedWindowAttribute) else { throw MacControlError.noWindow }
         let field: AXUIElement?
         if [.paste, .pressReturn].contains(command.intent) {
-            field = try validateInputContext(app: app, ax: ax, requireEditable: command.intent == .paste)
+            field = try await validateInputContext(app: app, ax: ax, requireEditable: command.intent == .paste)
         } else { field = nil }
         let windows = command.intent == .closeAllWindows ? try windowSnapshot(ax) : nil
         try Task.checkCancellation()
@@ -232,13 +232,20 @@ final class MacControlDriver {
         case .newTab:
             guard Self.tabApplicationIDs.contains(id) else { throw MacControlError.unsupported }
             guard !hasBlockingDialog(ax) else { throw MacControlError.blockedByDialog }
-            try shortcut(17, flags: .maskCommand, app: app)
+            try await shortcut(17, flags: .maskCommand, app: app) { [self] in
+                guard !hasBlockingDialog(ax) else { throw MacControlError.blockedByDialog }
+            }
             return "已向 \(name) 发送新标签页快捷键（⌘T）；页面是否加载完成尚未验证。"
         case .closeTab:
             guard Self.tabApplicationIDs.contains(id) else { throw MacControlError.unsupported }
             guard !hasBlockingDialog(ax) else { throw MacControlError.blockedByDialog }
-            guard elementAttribute(ax, kAXFocusedWindowAttribute) != nil else { throw MacControlError.noWindow }
-            try shortcut(13, flags: .maskCommand, app: app)
+            guard let window = elementAttribute(ax, kAXFocusedWindowAttribute) else { throw MacControlError.noWindow }
+            try await shortcut(13, flags: .maskCommand, app: app) { [self] in
+                guard !hasBlockingDialog(ax) else { throw MacControlError.blockedByDialog }
+                guard let current = elementAttribute(ax, kAXFocusedWindowAttribute), CFEqual(current, window) else {
+                    throw MacControlError.focusChanged
+                }
+            }
             return "已向 \(name) 发送关闭当前标签页快捷键（⌘W）；关闭结果尚未验证。"
         case .newWindow:
             guard !hasBlockingDialog(ax) else { throw MacControlError.blockedByDialog }
@@ -246,7 +253,9 @@ final class MacControlDriver {
             if launchedForCreation, let before, !before.isEmpty {
                 return "已启动 \(name)，并观察到它打开了窗口。"
             }
-            try shortcut(45, flags: .maskCommand, app: app)
+            try await shortcut(45, flags: .maskCommand, app: app) { [self] in
+                guard !hasBlockingDialog(ax) else { throw MacControlError.blockedByDialog }
+            }
             try await Task.sleep(nanoseconds: 180_000_000)
             if let before, let after = try? windowSnapshot(ax),
                after.contains(where: { candidate in !before.contains(where: { CFEqual(candidate, $0) }) }) {
@@ -257,27 +266,32 @@ final class MacControlDriver {
         case .closeAllWindows: return try await closeWindows(app: app, all: true, expectedWindows: context?.windows)
         case .typeText:
             guard let text = command.text, !text.isEmpty else { throw MacControlError.noEditableField }
-            let observed = try insertLiteralText(text, app: app, ax: ax)
+            let observed = try await insertLiteralText(text, app: app, ax: ax)
             return observed ? "已读取并确认 \(name) 编辑框中的文字更新；未发送回车。"
                 : "\(name) 已接受文字写入；无法读取确认最终内容，未发送回车。"
         case .pressReturn:
-            let field = try validateInputContext(app: app, ax: ax, requireEditable: false)
-            if let context { try verifyConfirmationContext(context, command: command, app: app, ax: ax) }
-            try verifyFocusedElement(field, app: app, ax: ax)
-            try shortcut(36, flags: [], app: app)
+            let field = try await validateInputContext(app: app, ax: ax, requireEditable: false)
+            try await shortcut(36, flags: [], app: app) { [self] in
+                if let context { try verifyConfirmationContext(context, command: command, app: app, ax: ax) }
+                try verifyFocusedElement(field, app: app, ax: ax)
+                try rejectProtectedField(field)
+            }
             return "已向 \(name) 发送回车；提交结果尚未验证。"
         case .copy:
-            try rejectProtectedField(elementAttribute(ax, kAXFocusedUIElementAttribute))
-            try shortcut(8, flags: .maskCommand, app: app)
+            try await shortcut(8, flags: .maskCommand, app: app) { [self] in
+                try rejectProtectedField(elementAttribute(ax, kAXFocusedUIElementAttribute))
+            }
             return "已向 \(name) 发送复制快捷键；未读取剪贴板。"
         case .paste:
-            let field = try validateInputContext(app: app, ax: ax, requireEditable: true)
-            if let context { try verifyConfirmationContext(context, command: command, app: app, ax: ax) }
-            try verifyFocusedElement(field, app: app, ax: ax)
-            try shortcut(9, flags: .maskCommand, app: app)
+            let field = try await validateInputContext(app: app, ax: ax, requireEditable: true)
+            try await shortcut(9, flags: .maskCommand, app: app) { [self] in
+                if let context { try verifyConfirmationContext(context, command: command, app: app, ax: ax) }
+                try verifyFocusedElement(field, app: app, ax: ax)
+                try rejectProtectedField(field)
+            }
             return "已向 \(name) 发送粘贴快捷键；粘贴结果尚未验证。"
         case .undo:
-            try shortcut(6, flags: .maskCommand, app: app)
+            try await shortcut(6, flags: .maskCommand, app: app)
             return "已向 \(name) 发送撤销快捷键；撤销结果尚未验证。"
         case .scrollDown, .scrollUp:
             guard let window = elementAttribute(ax, kAXFocusedWindowAttribute) else { throw MacControlError.noWindow }
@@ -287,8 +301,13 @@ final class MacControlDriver {
                 throw MacControlError.actionFailed
             }
             event.location = point
-            try verifyFocus(app)
-            event.postToPid(app.processIdentifier)
+            try await Self.withNativeActionCheckpoint {
+                guard let current = elementAttribute(ax, kAXFocusedWindowAttribute), CFEqual(current, window) else {
+                    throw MacControlError.focusChanged
+                }
+                try verifyFocus(app)
+                event.postToPid(app.processIdentifier)
+            }
             return "已向 \(name) 当前窗口发送滚动；滚动位置尚未验证。"
         case .clickElement:
             return try await click(goal: goal.isEmpty ? (command.text ?? "") : goal, app: app, jev: jev)
@@ -310,27 +329,43 @@ final class MacControlDriver {
         }
     }
 
-    private func shortcut(_ key: CGKeyCode, flags: CGEventFlags, app: NSRunningApplication) throws {
+    /// AX reads are synchronous. Let the main actor process queued Stop/Escape
+    /// callbacks before revalidating the target and performing a native action.
+    static func withNativeActionCheckpoint<Result>(_ action: () throws -> Result) async throws -> Result {
+        try await Task.sleep(nanoseconds: 1_000_000)
+        try Task.checkCancellation()
+        return try action()
+    }
+
+    private func shortcut(_ key: CGKeyCode, flags: CGEventFlags, app: NSRunningApplication,
+                          revalidate: (() throws -> Void)? = nil) async throws {
         guard let down = CGEvent(keyboardEventSource: nil, virtualKey: key, keyDown: true),
               let up = CGEvent(keyboardEventSource: nil, virtualKey: key, keyDown: false) else { throw MacControlError.actionFailed }
         down.flags = flags; up.flags = flags
-        try verifyFocus(app)
-        down.postToPid(app.processIdentifier)
-        // Always release a delivered key, even if cancellation arrives immediately after key-down.
-        up.postToPid(app.processIdentifier)
+        try await Self.withNativeActionCheckpoint {
+            try revalidate?()
+            try verifyFocus(app)
+            down.postToPid(app.processIdentifier)
+            // Always release a delivered key; never suspend between key-down and key-up.
+            up.postToPid(app.processIdentifier)
+        }
     }
 
-    private func insertLiteralText(_ text: String, app: NSRunningApplication, ax: AXUIElement) throws -> Bool {
-        let field = try validateInputContext(app: app, ax: ax, requireEditable: true)
+    private func insertLiteralText(_ text: String, app: NSRunningApplication, ax: AXUIElement) async throws -> Bool {
+        let field = try await validateInputContext(app: app, ax: ax, requireEditable: true)
         if isSettable(field, kAXSelectedTextAttribute) {
+            let before = stringAttribute(field, kAXValueAttribute)
+            let range = selectedRange(field)
             let expected: String?
-            if let before = stringAttribute(field, kAXValueAttribute), before.utf16.count <= 100_000,
-               let range = selectedRange(field) {
+            if let before, before.utf16.count <= 100_000, let range {
                 expected = Self.replacingSelection(in: before, range: range, with: text)
             } else { expected = nil }
-            try verifyFocusedElement(field, app: app, ax: ax)
-            guard AXUIElementSetAttributeValue(field, kAXSelectedTextAttribute as CFString, text as CFString) == .success else {
-                throw MacControlError.actionFailed
+            try await Self.withNativeActionCheckpoint {
+                try verifyFocusedElement(field, app: app, ax: ax)
+                try verifyTextSelection(field, value: before, range: range)
+                guard AXUIElementSetAttributeValue(field, kAXSelectedTextAttribute as CFString, text as CFString) == .success else {
+                    throw MacControlError.actionFailed
+                }
             }
             return expected.map { stringAttribute(field, kAXValueAttribute) == $0 } ?? false
         }
@@ -341,9 +376,12 @@ final class MacControlDriver {
               let replacement = Self.replacingSelection(in: value, range: range, with: text) else {
             throw MacControlError.noEditableField
         }
-        try verifyFocusedElement(field, app: app, ax: ax)
-        guard AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, replacement as CFString) == .success else {
-            throw MacControlError.actionFailed
+        try await Self.withNativeActionCheckpoint {
+            try verifyFocusedElement(field, app: app, ax: ax)
+            try verifyTextSelection(field, value: value, range: range)
+            guard AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, replacement as CFString) == .success else {
+                throw MacControlError.actionFailed
+            }
         }
         if isSettable(field, kAXSelectedTextRangeAttribute), (try? verifyFocusedElement(field, app: app, ax: ax)) != nil {
             var caret = CFRange(location: range.location + text.utf16.count, length: 0)
@@ -352,6 +390,16 @@ final class MacControlDriver {
             }
         }
         return stringAttribute(field, kAXValueAttribute) == replacement
+    }
+
+    private func verifyTextSelection(_ field: AXUIElement, value: String?, range: CFRange?) throws {
+        try rejectProtectedField(field)
+        if let value, stringAttribute(field, kAXValueAttribute) != value { throw MacControlError.focusChanged }
+        if let range {
+            guard let current = selectedRange(field), current.location == range.location, current.length == range.length else {
+                throw MacControlError.focusChanged
+            }
+        }
     }
 
     private func verifyFocusedElement(_ field: AXUIElement, app: NSRunningApplication, ax: AXUIElement) throws {
@@ -379,16 +427,26 @@ final class MacControlDriver {
         return ["terminal", "iterm", "ghostty", "warp", "cmux", "wezterm", "alacritty", "kitty"].contains { id.contains($0) }
     }
 
-    private func validateInputContext(app: NSRunningApplication, ax: AXUIElement, requireEditable: Bool) throws -> AXUIElement {
+    nonisolated static func isTerminalElement(role: String?, identifier: String?, roleDescription: String?) -> Bool {
+        // Window/app labels can be arbitrary document titles, not widget types.
+        guard role != kAXWindowRole, role != kAXApplicationRole else { return false }
+        let metadata = [role, identifier, roleDescription].compactMap { $0 }.joined(separator: " ").lowercased()
+        return metadata.contains("terminal") || metadata.contains("xterm") || metadata.contains("终端")
+    }
+
+    private func validateInputContext(app: NSRunningApplication, ax: AXUIElement, requireEditable: Bool) async throws -> AXUIElement {
         if Self.isTerminalApplication(app.bundleIdentifier ?? "") { throw MacControlError.terminalInput }
         guard let field = elementAttribute(ax, kAXFocusedUIElementAttribute) else { throw MacControlError.noEditableField }
         try rejectProtectedField(field)
         var element: AXUIElement? = field
         for _ in 0..<6 {
+            try await Self.withNativeActionCheckpoint {}
             guard let current = element else { break }
-            let labels = [kAXTitleAttribute, kAXDescriptionAttribute, kAXRoleDescriptionAttribute, kAXIdentifierAttribute]
-                .compactMap { stringAttribute(current, $0) }.joined(separator: " ").lowercased()
-            if labels.contains("terminal") || labels.contains("终端") { throw MacControlError.terminalInput }
+            if Self.isTerminalElement(role: stringAttribute(current, kAXRoleAttribute),
+                                      identifier: stringAttribute(current, kAXIdentifierAttribute),
+                                      roleDescription: stringAttribute(current, kAXRoleDescriptionAttribute)) {
+                throw MacControlError.terminalInput
+            }
             element = elementAttribute(current, kAXParentAttribute)
         }
         if requireEditable {
@@ -428,8 +486,14 @@ final class MacControlDriver {
             guard let close = elementAttribute(window, kAXCloseButtonAttribute), boolAttribute(close, kAXEnabledAttribute) != false else {
                 return "已观察到 \(observedClosed) 个窗口关闭；遇到无法关闭的窗口，已停止。"
             }
-            try verifyFocus(app)
-            guard AXUIElementPerformAction(close, kAXPressAction as CFString) == .success else {
+            let delivered = try await Self.withNativeActionCheckpoint {
+                guard !hasBlockingDialog(ax) else { throw MacControlError.blockedByDialog }
+                guard let currentClose = elementAttribute(window, kAXCloseButtonAttribute), CFEqual(currentClose, close),
+                      boolAttribute(close, kAXEnabledAttribute) != false else { throw MacControlError.staleElement }
+                try verifyFocus(app)
+                return AXUIElementPerformAction(close, kAXPressAction as CFString)
+            }
+            guard delivered == .success else {
                 if observedClosed == 0 { throw MacControlError.actionFailed }
                 return "已观察到 \(observedClosed) 个窗口关闭；后续关闭请求未被接受，已停止。"
             }
@@ -486,8 +550,15 @@ final class MacControlDriver {
               actions(control.element).contains(kAXPressAction) else { throw MacControlError.staleElement }
         var pid: pid_t = 0
         guard AXUIElementGetPid(control.element, &pid) == .success, pid == app.processIdentifier else { throw MacControlError.staleElement }
-        try verifyFocus(app)
-        guard AXUIElementPerformAction(control.element, kAXPressAction as CFString) == .success else { throw MacControlError.actionFailed }
+        try await Self.withNativeActionCheckpoint {
+            guard let current = elementAttribute(ax, kAXFocusedWindowAttribute), CFEqual(current, window),
+                  controlLabel(control.element) == control.label,
+                  boolAttribute(control.element, "AXHidden") != true,
+                  boolAttribute(control.element, kAXEnabledAttribute) != false,
+                  actions(control.element).contains(kAXPressAction) else { throw MacControlError.staleElement }
+            try verifyFocus(app)
+            guard AXUIElementPerformAction(control.element, kAXPressAction as CFString) == .success else { throw MacControlError.actionFailed }
+        }
         return "已向 \(app.localizedName ?? "目标 App") 的控件发送点击；点击后的任务结果尚未验证。"
     }
 

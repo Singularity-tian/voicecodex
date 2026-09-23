@@ -53,7 +53,7 @@ enum MacLiteralText {
     }
 
     private static let quotePattern = #""([^"]+)"|“([^”]+)”|(?<![\p{Latin}\p{N}])'([^']+)'(?![\p{Latin}\p{N}])|‘([^’]+)’|「([^」]+)」|『([^』]+)』"#
-    private static let secondaryActionPattern = #"(?:(?:(?:and\s+then|then|and)\s+|[,;]\s*)(?:press|hit|click|open|close|launch|send|submit|save|copy|paste|undo|scroll|type|enter)\b|(?:然后|接着|随后|并且|并|再|[,，;；])\s*(?:按|点|打开|关闭|发送|提交|保存|复制|粘贴|撤销|滚动|输入))"#
+    private static let secondaryActionPattern = #"(?:(?:(?:and\s+then|then|and)\s+|[,;]\s*)(?:press|hit|click|open|close|launch|send|submit|save|copy|paste|undo|scroll|type|enter)\b|(?:然后|接着|随后|并且|并|再|[,，;；])\s*(?:按|点|打开|关闭|发送|提交|保存|复制|粘贴|撤销|滚动|输入|回车|换行))"#
 
     /// Parse the instruction around an explicitly dictated payload. Raw payload
     /// text stays local; action and target selection see only the envelope.
@@ -69,11 +69,16 @@ enum MacLiteralText {
         guard let marker = markers.matches(in: transcript, range: fullRange).first(where: { candidate in
             guard !spans.contains(where: { NSLocationInRange(candidate.range.location, $0.range) }),
                   let range = Range(candidate.range, in: transcript) else { return false }
-            if transcript[range].lowercased() == "enter" {
-                let prefix = String(transcript[..<range.lowerBound])
-                if prefix.range(of: #"(?:\b(?:press|hit|tap)\s+|按(?:下|一下)?\s*)$"#,
-                                options: [.regularExpression, .caseInsensitive]) != nil { return false }
+            // A word naming the requested control is not a typing verb. Ignore
+            // quoted names in the prefix, and stop a click clause at sequencing
+            // words so "click ... then type hello" still has a typing envelope.
+            let prefix = String(transcript[..<range.lowerBound])
+            let controlPrefix = NSMutableString(string: prefix)
+            for span in spans.reversed() where NSMaxRange(span.range) <= controlPrefix.length {
+                controlPrefix.replaceCharacters(in: span.range, with: String(repeating: " ", count: span.range.length))
             }
+            if (controlPrefix as String).range(of: #"(?:(?:\b(?:click|tap|press|hit|select|choose)\b|点击|单击|双击|选择)(?:(?!(?:\b(?:then|and)\b|然后|接着|随后|并且|并|再|[,，;；.!?。！？\n])).)*|(?:按(?:下|一下)?|点(?:一下)?)\s*)$"#,
+                                              options: [.regularExpression, .caseInsensitive]) != nil { return false }
             return true
         }), let markerRange = Range(marker.range, in: transcript) else { return unchanged }
 

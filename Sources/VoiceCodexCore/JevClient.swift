@@ -248,6 +248,9 @@ public final class JevClient: @unchecked Sendable {
     Opening one of these apps means openApp; creating a document/window requires an explicit request.
     An explicit NEW TAB or NEW WINDOW request takes precedence over the verb 'open':
     'Open a new window in Finder' is newWindow, not openApp. 'Open a new tab in Chrome' is newTab.
+    An explicit click on a named button or control is clickElement even if its label is Enter,
+    Type, or 输入. 'Click the Enter button' and '点击输入按钮' are clickElement; 'Press Enter'
+    asks for the keyboard key and is pressReturn. The requested verb takes precedence over the label.
     Naming a destination app is not another action: 'In TextEdit, type hello world' is one typeText
     action even if another app is currently foreground. Do not guess execution preconditions.
     Select unsupported for multiple independent

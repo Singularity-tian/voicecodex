@@ -376,7 +376,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 }
                 var confirmationContext: MacControlDriver.ConfirmationContext?
                 if self.macDriver.requiresConfirmation(command) {
-                    confirmationContext = try self.macDriver.captureConfirmationContext(command: command)
+                    confirmationContext = try await self.macDriver.captureConfirmationContext(command: command)
                     guard await self.confirmMacAction(command, description: description) else {
                         throw CancellationError()
                     }

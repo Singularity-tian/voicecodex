@@ -81,4 +81,62 @@ final class MacControlDriverTests: XCTestCase {
         XCTAssertFalse(MacControlDriver.isTerminalApplication("com.apple.Stickies"))
         XCTAssertFalse(MacControlDriver.isTerminalApplication("com.google.Chrome"))
     }
+
+    func testDocumentMetadataCannotTurnAnOrdinaryEditorIntoATerminal() {
+        XCTAssertFalse(MacControlDriver.isTerminalElement(role: kAXWindowRole,
+            identifier: "Terminal notes.txt", roleDescription: "终端使用说明"))
+        XCTAssertFalse(MacControlDriver.isTerminalElement(role: kAXApplicationRole,
+            identifier: "com.example.terminal-tutorial", roleDescription: "Terminal documentation"))
+        XCTAssertFalse(MacControlDriver.isTerminalElement(role: kAXTextAreaRole,
+            identifier: "document-editor", roleDescription: "text area"))
+    }
+
+    func testEmbeddedTerminalWidgetMetadataIsStillRejected() {
+        XCTAssertTrue(MacControlDriver.isTerminalElement(role: kAXTextAreaRole,
+            identifier: "terminal-input", roleDescription: "text area"))
+        XCTAssertTrue(MacControlDriver.isTerminalElement(role: kAXTextAreaRole,
+            identifier: "xterm-helper-textarea", roleDescription: "text area"))
+        XCTAssertTrue(MacControlDriver.isTerminalElement(role: "AXTerminal",
+            identifier: nil, roleDescription: "终端"))
+    }
+
+    @MainActor
+    func testStopQueuedDuringSynchronousInspectionPreventsThePendingWrite() async throws {
+        var stopDelivered = false
+        var writes = 0
+        var operation: Task<Void, Error>?
+        operation = Task { @MainActor in
+            // Models an Escape callback queued on the same actor while an AX
+            // read blocks. This fixture performs no accessibility or UI action.
+            Task { @MainActor in
+                stopDelivered = true
+                operation?.cancel()
+            }
+            Self.delayedReadFixture()
+            XCTAssertFalse(stopDelivered)
+            try await MacControlDriver.withNativeActionCheckpoint { writes += 1 }
+        }
+        do {
+            try await operation?.value
+            XCTFail("The queued stop should cancel the native-action checkpoint")
+        } catch is CancellationError {
+            XCTAssertTrue(stopDelivered)
+            XCTAssertEqual(writes, 0)
+        }
+    }
+
+    @MainActor
+    func testNativeActionCheckpointDeliversAnUncancelledActionExactlyOnce() async throws {
+        var writes = 0
+        let result = try await MacControlDriver.withNativeActionCheckpoint {
+            writes += 1
+            return "delivered"
+        }
+        XCTAssertEqual(result, "delivered")
+        XCTAssertEqual(writes, 1)
+    }
+
+    private static func delayedReadFixture() {
+        Thread.sleep(forTimeInterval: 0.02)
+    }
 }

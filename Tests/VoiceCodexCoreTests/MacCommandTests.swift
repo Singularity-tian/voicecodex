@@ -66,6 +66,21 @@ final class MacCommandTests: XCTestCase {
         XCTAssertFalse(MacLiteralText.request(in: "在文本编辑里，输入“你好”").hasSecondaryAction)
     }
 
+    func testTypingWordsInRequestedControlLabelsRemainRoutingText() {
+        for transcript in ["点击输入框", "点击那个输入框", "点击输入按钮", "Click the Enter button", "Click the green Enter button", "Click Enter",
+                           "选择输入法", "Click the Type button"] {
+            let parsed = MacLiteralText.request(in: transcript)
+            XCTAssertFalse(parsed.isTypingEnvelope, transcript)
+            XCTAssertTrue(parsed.candidates.isEmpty, transcript)
+            XCTAssertEqual(parsed.routingTranscript, transcript)
+        }
+        for transcript in ["点击输入框然后输入hello", "点击那个输入框然后输入hello",
+                           "Click the Enter button then type hello", "Click the green Enter button then type hello"] {
+            XCTAssertTrue(MacLiteralText.request(in: transcript).hasSecondaryAction, transcript)
+        }
+        XCTAssertEqual(MacLiteralText.request(in: "在“点击”里输入“你好”").candidates, ["你好"])
+    }
+
     func testSecondaryActionsOutsidePayloadAreNotMasked() {
         let quoted = MacLiteralText.request(in: "Type \"hello\" then close the window")
         XCTAssertEqual(quoted.candidates, ["hello"])
@@ -80,6 +95,16 @@ final class MacCommandTests: XCTestCase {
         XCTAssertTrue(chinese.routingTranscript.contains("然后按回车"))
         XCTAssertTrue(chinese.hasSecondaryAction)
         XCTAssertTrue(MacLiteralText.request(in: "Open Chrome then type hello").hasSecondaryAction)
+        for action in ["回车", "换行"] {
+            let compound = MacLiteralText.request(in: "输入 hello 然后\(action)")
+            XCTAssertEqual(compound.candidates, ["hello"])
+            XCTAssertTrue(compound.hasSecondaryAction)
+            XCTAssertTrue(compound.routingTranscript.contains("然后\(action)"))
+            let quoted = MacLiteralText.request(in: "输入「hello 然后\(action)」")
+            XCTAssertEqual(quoted.candidates, ["hello 然后\(action)"])
+            XCTAssertFalse(quoted.hasSecondaryAction)
+            XCTAssertFalse(quoted.routingTranscript.contains(action))
+        }
     }
 
     func testNestedQuotedProseRetainsWholeUnquotedLiteral() {

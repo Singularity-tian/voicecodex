@@ -169,11 +169,44 @@ final class JevClientTests: XCTestCase {
             return (200, try Self.answer(request, choices: ["action": "typeText", "application": "current"]))
         }
         defer { fixture.close() }
-        for transcript in ["Type \"hello\" then close the window", "type hello and press Return", "输入hello然后按回车"] {
+        for transcript in ["Type \"hello\" then close the window", "type hello and press Return", "输入hello然后按回车",
+                           "输入 hello 然后回车", "输入 hello 然后换行", "输入「hello」然后回车"] {
             await assertError(.unsupportedCommand) {
                 _ = try await fixture.client.plan(transcript: transcript, applications: self.applications,
                                                    currentApplicationID: "com.example.Browser")
             }
+        }
+    }
+
+    func testClickRequestsContainingTypingWordsRemainExecutableClickIntents() async throws {
+        for transcript in ["点击输入框", "点击那个输入框", "点击输入按钮", "Click the Enter button", "Click the green Enter button", "Click Enter"] {
+            let fixture = JevHTTPFixture { request in
+                let state = try XCTUnwrap(Self.body(request)["state"] as? [String: String])
+                XCTAssertEqual(state["user_command"], transcript)
+                XCTAssertEqual(state["literal_entry_envelope"], "false")
+                return (200, try Self.answer(request, choices: ["action": "clickElement", "application": "current"]))
+            }
+            defer { fixture.close() }
+            let command = try await fixture.client.plan(transcript: transcript, applications: applications,
+                                                        currentApplicationID: "com.example.Browser")
+            XCTAssertEqual(command.intent, .clickElement)
+            XCTAssertEqual(command.applicationID, "com.example.Browser")
+            XCTAssertNil(command.text)
+        }
+    }
+
+    func testQuotedReturnInstructionsStayExactLiteralText() async throws {
+        for payload in ["hello 然后回车", "hello 然后换行", "点击输入框", "Click the Enter button"] {
+            let fixture = JevHTTPFixture { request in
+                let state = try XCTUnwrap(Self.body(request)["state"] as? [String: String])
+                XCTAssertFalse(state["user_command"]?.contains(payload) == true)
+                return (200, try Self.answer(request, choices: ["action": "typeText", "application": "current"]))
+            }
+            defer { fixture.close() }
+            let command = try await fixture.client.plan(transcript: "输入「\(payload)」", applications: applications,
+                                                        currentApplicationID: "com.example.Browser")
+            XCTAssertEqual(command.intent, .typeText)
+            XCTAssertEqual(command.text, payload)
         }
     }
 
