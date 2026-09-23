@@ -1,5 +1,7 @@
 // Opt-in live integration check. Receives only fixed synthetic audio fixtures.
 // Run with script/test_speech_live.sh --live; no microphone or desktop input.
+// Offline configuration check: .build/qa/speech-live-check --check-config
+// A nonexistent VOICECODEX_ENV_FILE must make this check exit 2 before any request.
 import AVFoundation
 import Foundation
 
@@ -77,7 +79,8 @@ struct SpeechLiveCheck {
 
     @MainActor
     static func main() async {
-        guard CommandLine.arguments.contains("--live") else {
+        let checkConfiguration = CommandLine.arguments.contains("--check-config")
+        guard CommandLine.arguments.contains("--live") || checkConfiguration else {
             print("Skipped: add --live to send synthetic audio to Soniox and make paid TypeSafe requests.")
             return
         }
@@ -87,6 +90,10 @@ struct SpeechLiveCheck {
             guard !credentials.soniox.isEmpty, !credentials.jev.isEmpty else {
                 print("Missing local SONIOX_API_KEY or TYPESAFE_API_KEY. No requests made.")
                 exit(2)
+            }
+            if checkConfiguration {
+                print("Local credentials loaded. No requests made.")
+                return
             }
             let configuration = URLSessionConfiguration.ephemeral
             configuration.timeoutIntervalForRequest = 15
@@ -212,6 +219,15 @@ struct SpeechLiveCheck {
             let jevModel: String?
         }
         let environment = ProcessInfo.processInfo.environment
+        let explicitPath = environment["VOICECODEX_ENV_FILE"].flatMap {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0
+        }
+        let selectedFile = URL(fileURLWithPath: ((explicitPath ?? ".env") as NSString).expandingTildeInPath)
+        // Match LocalConfig: an explicit missing file is a configuration error,
+        // never permission to make paid requests using a fallback account.
+        if explicitPath != nil, !FileManager.default.fileExists(atPath: selectedFile.path) {
+            throw HarnessFailure.setup
+        }
         let support = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/VoiceCodex", isDirectory: true)
         var credentials = Credentials()
@@ -221,9 +237,7 @@ struct SpeechLiveCheck {
                                "TYPESAFE_API_KEY": saved.jevAPIKey ?? "",
                                "TYPESAFE_DEFAULT_MODEL": saved.jevModel ?? ""])
         }
-        let selected = environment["VOICECODEX_ENV_FILE"].flatMap { $0.isEmpty ? nil : $0 } ?? ".env"
-        let files = [support.appendingPathComponent(".env"),
-                     URL(fileURLWithPath: (selected as NSString).expandingTildeInPath)]
+        let files = [support.appendingPathComponent(".env"), selectedFile]
         for file in files where FileManager.default.fileExists(atPath: file.path) {
             credentials.apply(try EnvironmentFile.parse(String(contentsOf: file, encoding: .utf8)))
         }
