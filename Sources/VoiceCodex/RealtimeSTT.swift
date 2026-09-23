@@ -22,7 +22,7 @@ final class RealtimeSTT {
     private var generation = UUID()
     private var finishing = false
 
-    func start(apiKey: String) async throws {
+    func start(apiKey: String, vocabularyProvider: (() -> [String: Any])? = nil) async throws {
         cancel()
         let token = UUID()
         generation = token
@@ -79,7 +79,10 @@ final class RealtimeSTT {
                 }
             })
             onStatus?("正在连接云端，已开始录音…")
-            try await stream.start(apiKey: apiKey)
+            // Discover app names after capture has started: a cold bundle scan
+            // must not discard the first word of a short voice command.
+            let context = vocabularyProvider?()
+            try await stream.start(apiKey: apiKey, context: context)
             guard generation == token else { throw CancellationError() }
             if !finishing { onStatus?("正在聆听… 松开快捷键执行") }
         } catch {
@@ -121,6 +124,24 @@ final class RealtimeSTT {
 @MainActor
 final class SonioxConnection {
     static let model = "stt-rt-v5"
+    static let languageHints = ["zh", "en"]
+    static var defaultContext: [String: Any] {
+        ["terms": ["Codex", "GitHub", "README", "worktree", "Swift", "Persom"]]
+    }
+
+    static func configuration(apiKey: String, context: [String: Any]? = nil) -> [String: Any] {
+        [
+            "api_key": apiKey,
+            "model": model,
+            "audio_format": "pcm_s16le",
+            "sample_rate": 16_000,
+            "num_channels": 1,
+            "language_hints": languageHints,
+            "enable_endpoint_detection": true,
+            "context": context ?? defaultContext,
+        ]
+    }
+
     let audioSink: AsyncStream<Data>.Continuation
     var onTranscript: ((String, Bool) -> Void)?
     var onFailure: ((Error) -> Void)?
@@ -144,7 +165,7 @@ final class SonioxConnection {
         audioSink = continuation
     }
 
-    func start(apiKey: String) async throws {
+    func start(apiKey: String, context: [String: Any]? = nil) async throws {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 15
         config.timeoutIntervalForResource = 180
@@ -187,16 +208,7 @@ final class SonioxConnection {
         }
 
         do {
-            let configuration: [String: Any] = [
-                "api_key": apiKey,
-                "model": Self.model,
-                "audio_format": "pcm_s16le",
-                "sample_rate": 16_000,
-                "num_channels": 1,
-                "language_hints": ["zh", "en"],
-                "enable_endpoint_detection": true,
-                "context": ["terms": ["Codex", "GitHub", "README", "worktree", "Swift", "Persom"]],
-            ]
+            let configuration = Self.configuration(apiKey: apiKey, context: context)
             let json = try JSONSerialization.data(withJSONObject: configuration)
             try await socket.send(.string(String(decoding: json, as: UTF8.self)))
             if let completion { _ = try completion.get(); return }

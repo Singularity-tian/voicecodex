@@ -2,7 +2,7 @@ import XCTest
 @testable import VoiceCodexCore
 
 final class CodexRunnerTests: XCTestCase {
-    func testSpeechCredentialIsRemovedWhileOtherEnvironmentSurvives() async throws {
+    func testProviderCredentialsAreRemovedWhileOtherEnvironmentSurvives() async throws {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
         let executable = try fixture.script("""
@@ -11,11 +11,16 @@ final class CodexRunnerTests: XCTestCase {
             printf '%s\\n' 'Speech credential unexpectedly present' >&2
             exit 1
         fi
+        if [ "${TYPESAFE_API_KEY+x}" = x ]; then
+            printf '%s\\n' 'Jev credential unexpectedly present' >&2
+            exit 1
+        fi
         printf '%s' "$VOICECODEX_TEST_CONTEXT" > \(fixture.quoted("context"))
         printf '%s\\n' '{"type":"item.completed","item":{"type":"agent_message","text":"Environment checked"}}'
         """)
         var environment = ProcessInfo.processInfo.environment
         environment["SONIOX_API_KEY"] = "fake-speech-secret-for-test"
+        environment["TYPESAFE_API_KEY"] = "fake-jev-secret-for-test"
         environment["VOICECODEX_TEST_CONTEXT"] = "preserve literal $text 中文"
         let runner = CodexRunner(executableURL: executable, environment: environment)
         let result = try await runner.run(prompt: "test", directory: fixture.directory,

@@ -1,12 +1,55 @@
 # VoiceCodex
 
-**Hold a key. Say what you need. Let Codex work.**
+**Hold a key. Say what you need. Control your Mac.**
 
-A small native macOS app that streams your voice to Soniox and sends the final transcript directly to Codex CLI. It works while another app is in front. Release the shortcut to execute; keep talking to continue the same Codex session.
+A native macOS voice controller with two modes: **Jev** selects native Mac actions, and **Codex** continues your coding session in Terminal. Soniox provides live Chinese / English transcription. Hold the shortcut from another app and release to execute.
 
-![VoiceCodex](docs/screenshot.png)
+Chinese and English can be mixed in one command. Every recording automatically loads installed App names and common Chinese/English aliases as Soniox vocabulary, prioritizing the current and running apps. The transcription panel shows the loaded hotword count; no manual language switch is needed.
 
-## What it does
+![VoiceCodex](docs/screenshot.jpg)
+
+## Control your Mac with Jev
+
+Inspired by [this Jev voice-control demo](https://www.youtube.com/shorts/vSzde5be5XE). The app uses TypeSafe's Jev API directly from Swift; no Node service, generated scripts, or Codex login is needed in Mac mode.
+
+1. Build and open the app with `./script/build_and_run.sh --install`.
+2. Choose **控制 Mac · Jev** and click **打开 .env**. Fill `TYPESAFE_API_KEY` with your TypeSafe key. The default model is pinned to `jev-1.13.0`. Save the file; the next command reloads it.
+3. Set a Soniox key in Settings, or set `SONIOX_API_KEY` in `.env`. An existing saved Soniox key is reused when the `.env` value is blank.
+4. Click **启用辅助功能** and enable VoiceCodex in macOS System Settings. Microphone access is requested on first recording.
+5. Hold **Control + Option + Space**, say one action, and release. **Esc** stops recording or further Mac actions. The text field uses the same Jev execution path.
+
+Try these commands, one at a time:
+
+| Say | Action |
+| --- | --- |
+| “打开 Chrome” / “Open Calculator” | Open or activate an installed app |
+| “在 Chrome 新建一个标签页” | Send ⌘T to Chrome |
+| “关闭当前标签页” | Close only the current browser tab with ⌘W |
+| “打开便笺” → “新建一个窗口” | Open Stickies, then create a note |
+| “输入「hello world」” / “Type hello world” | Insert your literal text at the focused editor's selection |
+| “向下滚动” / “复制” / “撤销” | Operate the captured target app |
+| “点击保存按钮” | Choose from observed, enabled Accessibility controls |
+| “关闭 Chrome 的所有窗口” | Review, then close observed windows; stop at a save dialog |
+
+Jev chooses from a fixed action vocabulary and observed app/control IDs. It does not generate prose, scripts, shell commands, or text to type. Literal typing content is held locally and hidden from action selection, so saying “输入「打开 Chrome」” enters those words. Say one operation per command; compound research/writing workflows are not implemented in Mac mode. Typing preserves the rest of an editable field and does not press Return. Protected fields and terminal input are blocked. Apps that do not expose usable Accessibility controls may need a manual click first.
+
+The target for an unnamed app is captured when recording starts. Named apps can be selected explicitly. Return, paste, clicking a control, and closing all windows have an in-app review step. A cancellation stops later actions; it does not undo input already delivered. Receipts distinguish observed changes from shortcuts whose final effect cannot be verified.
+
+“关闭窗口” closes the whole window, including its tabs. Use “关闭当前标签页” for one tab. New-tab and new-window commands can launch a stopped target app. Confirmation binds to the selected process, window, and input field; changing them while reviewing stops the action.
+
+### Local `.env`
+
+The installed app defaults to `~/Library/Application Support/VoiceCodex/.env`. Use **打开 .env** to create/open it with private file permissions. For a development launch, `.env` in the working directory or `VOICECODEX_ENV_FILE` can override it. `.env.example` is a template only; no key is bundled.
+
+```dotenv
+TYPESAFE_API_KEY=
+TYPESAFE_DEFAULT_MODEL=jev-1.13.0
+SONIOX_API_KEY=
+```
+
+Precedence is saved settings → Application Support `.env` → selected development `.env` → process environment. Blank key values preserve an existing key. Parsing is literal: no shell execution or variable expansion. Never commit real `.env` files. See [Jev integration details](docs/jev.md).
+
+## Codex coding mode
 
 - Global **Control + Option + Space** push-to-talk (Control + Shift + Space fallback if occupied).
 - Live Chinese / English transcription with Soniox's streaming WebSocket API.
@@ -20,7 +63,7 @@ This is an early demo. Release the shortcut to send your instruction to a real C
 
 ## Run
 
-Requires macOS 14+, Xcode Command Line Tools / Swift 5.9+, a [Soniox API key](https://console.soniox.com/), and an installed, authenticated [Codex CLI](https://developers.openai.com/codex/cli/).
+Requires macOS 14+, Xcode Command Line Tools / Swift 5.9+, and a [Soniox API key](https://console.soniox.com/) for speech. Mac mode also needs a TypeSafe API key; coding mode needs an installed, authenticated [Codex CLI](https://developers.openai.com/codex/cli/).
 
 ```sh
 git clone https://github.com/Singularity-tian/voicecodex.git
@@ -55,11 +98,14 @@ You can also hold the **按住说话** button, or type a prompt in the bottom fi
 ## Local data and permissions
 
 - Audio is captured only for an explicit recording and streamed to **Soniox**. VoiceCodex keeps audio in memory and does not save recordings.
+- Each recording also sends **Soniox** a bounded vocabulary of installed App display names and known aliases. It contains no app paths, window titles, documents, or history; see [speech configuration](docs/soniox.md).
 - The app waits for Soniox's final completion response. A network or transcription error does not execute a partial transcript.
 - Final text is sent to **Codex**, using the account and provider configuration already configured for your CLI.
+- In Mac mode, the routing instruction and app names/identifiers are sent to **TypeSafe**. Recognized literal typing payloads are replaced with a placeholder and remain local during planning. A click command additionally sends bounded Accessibility role/title/description text for the selected window. Screenshots, clipboard contents, and whole documents are not sent to Jev. Transcripts and action receipts are saved privately in `mac-history.txt`, separately from the coding session history.
 - Settings, the Soniox credential, session IDs, and local transcript/output history live in `~/Library/Application Support/VoiceCodex/`. Config and history files use mode `0600`.
 - Task worktrees live under that directory's `worktrees/`. They are preserved when you start a new task; remove finished ones with `git worktree remove` when ready.
 - The Soniox key is used by the voice app and is not added to the Codex child-process environment. `SONIOX_API_KEY` is also supported for explicitly configured development launches.
+- The TypeSafe key is likewise removed from managed Codex child-process environments. Neither key appears in command arguments.
 - The interactive TUI runs with `-a on-request`, `--sandbox workspace-write`, and `--no-alt-screen` to keep terminal scrollback. Approval prompts appear in Terminal. Tool-specific and macOS permissions still apply; Terminal mode does not grant access to a blocked app.
 - Each active VoiceCodex connection uses its own Codex app-server bound to `127.0.0.1`, protected by a random bearer token in a private local file. It does not replace or restart any existing Codex daemon. The Terminal launcher reads that token into a named environment variable; it is not embedded in the launch script or command arguments.
 - Stop clears pending instructions and requests interruption of the active turn; the terminal remains available for another instruction. Closing its Terminal session, starting a new task, or quitting VoiceCodex shuts down the server owned by the app. Already-completed edits remain; detached child processes are not independently managed by this demo.
@@ -76,10 +122,15 @@ swift test
 
 The Codex app's Run action calls `script/build_and_run.sh`. Other modes include `--logs`, `--telemetry`, and `--debug`.
 
+For opt-in real API checks and disposable desktop scenarios, see [the QA guide](docs/testing.md). Synthetic speech checks exercise Soniox finalization and Jev planning without recording the microphone or operating other apps.
+
 | Component | Responsibility |
 | --- | --- |
 | `GlobalHotkey` | Carbon global press/release events |
 | `RealtimeSTT` | AVAudioEngine capture, PCM conversion, Soniox streaming and finalization |
+| `JevClient` | Typed action/app/control selection, confidence and response validation |
+| `MacControlDriver` | Native app activation, targeted input, bounded AX reads and receipts |
+| `EnvironmentFile` | Literal `.env` parsing without shell execution |
 | `AppController` | Recording lifecycle, prompt queue, session selection and local state |
 | `TerminalSession` | Authenticated local app-server, literal JSON prompts, queue, status and interruption |
 | `TerminalLauncher` | Private launch files for a real Codex TUI in Terminal.app |

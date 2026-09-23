@@ -107,6 +107,7 @@ public final class TerminalSession {
                                  "--ws-token-file", tokenFile.path]
             var environment = ProcessInfo.processInfo.environment
             environment.removeValue(forKey: "SONIOX_API_KEY")
+            environment.removeValue(forKey: "TYPESAFE_API_KEY")
             environment.removeValue(forKey: "VOICECODEX_REMOTE_TOKEN")
             process.environment = environment
             process.standardInput = FileHandle.nullDevice
