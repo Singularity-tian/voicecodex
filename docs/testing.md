@@ -87,3 +87,38 @@ These are bounded regression results, not a claim that every phrasing or applica
 - A separate live recheck of Chinese Return, “Press Enter”, and “Hit Return” passed 3/3 after the intent clarification.
 - Final app rebuilt, signed, installed, and process-verified. Through its actual text-command UI, the bare “输入 hello 然后回车” request was rejected; “打开计算器” produced a successful app-open receipt and the Calculator window was observed separately.
 - Native text insertion, tab manipulation, control clicks, microphone hardware, and global push-to-talk still require desktop acceptance with user-granted permissions; the new fixture and live planner checks do not prove those outcomes.
+
+
+## Continuous actions and speech endpoints
+
+Run `swift test` for sequence parsing, ordered planning, target carry, queued arrivals, bounded backlog, cancellation, failures, endpoint boundaries, EOF deduplication, and local OCR coordinate/revalidation tests. These unit tests never operate desktop apps or record a microphone.
+
+```sh
+./script/test_speech_live.sh --live --endpoints
+./script/test_signing_identity.sh
+```
+
+The endpoint check sends two fixed synthetic phrases with silence between them to Soniox, without microphone capture or desktop input. It requires the first utterance callback before EOF, exactly two ordered segments, one full final transcript, and no replay on a repeated finish. Results stay in ignored `.build/qa/`.
+
+Desktop acceptance: type `打开计算器，然后打开日历` and verify two ordered receipts plus the final target window. For Tencent Meeting, verify `打开腾讯会议，然后创建一个新的会议` selects the currently observed Quick Meeting label for review. AX-only builds cannot operate its custom-drawn home buttons; the local OCR fallback requires user-granted Screen Recording access. Do not treat planner/fixture success as actual meeting creation. Decline the review when a test should not start a real meeting.
+
+For microphone acceptance, enable **边说边做**, hold the shortcut and say an app-open command, pause until it executes while still holding, then say another and release. Confirm that each runs once. Esc during planning must prevent later actions. Disable the checkbox to check release-only behavior; coding mode must continue to submit one complete prompt.
+
+### Opt-in sequence planner and observed-label fixtures
+
+Compile the production parser and Jev client directly, without taking the SwiftPM build lock:
+
+```sh
+mkdir -p .build/qa
+swiftc Sources/VoiceCodexCore/EnvironmentFile.swift \
+  Sources/VoiceCodexCore/MacCommand.swift \
+  Sources/VoiceCodexCore/MacCommandSequence.swift \
+  Sources/VoiceCodexCore/SpeechVocabulary.swift \
+  Sources/VoiceCodexCore/JevClient.swift \
+  script/jev_sequence_live_check.swift -o .build/jev-sequence-live-check
+.build/jev-sequence-live-check --live --output .build/qa/jev-sequence-results.json
+```
+
+The explicit `--live` flag authorizes real TypeSafe requests using the existing local application-support `.env`. The harness sends fixed public app descriptors, synthetic commands, and synthetic observed labels; it reads no windows, captures no audio or screenshots, and performs no desktop input. Seven sequence cases cover the full Tencent Meeting request in Chinese/English, Chrome then a new tab, quoted text then Return, and a leading streaming continuation. Six control fixtures distinguish immediate new meetings from joining, scheduling, and sharing, including `AXButton` and `屏幕文字` label formats and an absent-target case.
+
+Each step must return the exact expected intent, application, and literal text. The next planner call receives the preceding planned app target; this simulates target carry and does not verify app activation. Control fixtures check selection only, including the Quick Meeting wording observed in Tencent Meeting. They do not prove that a button was clicked or a meeting was created. The report retains numeric model confidence, pass/fail, and latency for every case, and saves after each completed case. Use `--filter case-id` for a bounded recheck and a different `--output` filename to preserve earlier failures. The production 0.75 confidence threshold stays unchanged.

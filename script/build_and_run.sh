@@ -3,26 +3,43 @@ set -euo pipefail
 
 APP_NAME="VoiceCodex"
 BUNDLE_ID="com.singularity.voicecodex"
-SIGNING_IDENTITY="${VOICECODEX_SIGNING_IDENTITY:--}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="$ROOT_DIR/dist"
 APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
 INSTALL_BUNDLE="$HOME/Applications/$APP_NAME.app"
 MODE="run"
 INSTALL_APP=false
+REMEMBER_SIGNING_IDENTITY=false
+SIGNING_CONFIG_FILE="$HOME/Library/Application Support/VoiceCodex/signing-identity"
 
 for argument in "$@"; do
   case "$argument" in
     run|--run) MODE="run" ;;
     --build-only|--verify|--debug|--logs|--telemetry) MODE="$argument" ;;
     --install) INSTALL_APP=true ;;
+    --remember-signing-identity) REMEMBER_SIGNING_IDENTITY=true ;;
     --help|-h)
-      echo "usage: $0 [run|--build-only|--verify|--debug|--logs|--telemetry] [--install]"
+      echo "usage: $0 [run|--build-only|--verify|--debug|--logs|--telemetry] [--install] [--remember-signing-identity]"
       exit 0
       ;;
     *) echo "Unknown option: $argument" >&2; exit 2 ;;
   esac
 done
+
+if $REMEMBER_SIGNING_IDENTITY && ! $INSTALL_APP; then
+  echo "--remember-signing-identity requires --install; a build alone cannot update the saved identity." >&2
+  exit 2
+fi
+# Resolve before stopping an app or building. Invalid/missing pinned identities
+# must not silently turn an update into a new ad hoc permission identity.
+source "$ROOT_DIR/script/signing_identity.sh"
+ALLOW_ADHOC_DEFAULT=false
+if [[ "$MODE" == '--build-only' ]] && ! $INSTALL_APP; then ALLOW_ADHOC_DEFAULT=true; fi
+SIGNING_IDENTITY="$(voicecodex_select_signing_identity "${VOICECODEX_SIGNING_IDENTITY:-}" "$SIGNING_CONFIG_FILE" "$ALLOW_ADHOC_DEFAULT")"
+if $REMEMBER_SIGNING_IDENTITY && [[ "$SIGNING_IDENTITY" == '-' ]]; then
+  echo "An ad hoc signature cannot be remembered; choose a certificate identity." >&2
+  exit 2
+fi
 
 target_pids() {
   local expected_binary="$1/Contents/MacOS/$APP_NAME"
@@ -95,6 +112,7 @@ if $INSTALL_APP; then
   mkdir -p "$(dirname "$INSTALL_BUNDLE")"
   rm -rf "$INSTALL_BUNDLE"
   /usr/bin/ditto "$APP_BUNDLE" "$INSTALL_BUNDLE"
+  voicecodex_finish_install_signing "$SIGNING_IDENTITY" "$SIGNING_CONFIG_FILE" "$INSTALL_BUNDLE" "$REMEMBER_SIGNING_IDENTITY"
   LAUNCH_BUNDLE="$INSTALL_BUNDLE"
 fi
 

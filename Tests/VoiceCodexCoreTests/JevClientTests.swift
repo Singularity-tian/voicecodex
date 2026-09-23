@@ -34,6 +34,43 @@ final class JevClientTests: XCTestCase {
         XCTAssertEqual(result.applicationID, "com.example.Browser")
     }
 
+    func testTencentMeetingStepsRemainSeparateWithPreviousActualTarget() async throws {
+        let steps = try MacCommandSequence.parse("你可以打开腾讯会议，然后创建一个新的会议吗？")
+        let app = MacApplication(id: "com.tencent.meeting", name: "TencentMeeting")
+        let fixture = JevHTTPFixture { request in
+            let state = try XCTUnwrap(Self.body(request)["state"] as? [String: String])
+            if state["user_command"] == steps[0] {
+                XCTAssertTrue(state["mentioned_installed_applications"]?.contains("腾讯会议") == true)
+                return (200, try Self.answer(request, choices: ["action": "openApp", "application": "app_0"]))
+            }
+            XCTAssertEqual(state["user_command"], "创建一个新的会议吗？")
+            XCTAssertEqual(state["current_application_id"], app.id)
+            return (200, try Self.answer(request, choices: ["action": "clickElement", "application": "current"]))
+        }
+        defer { fixture.close() }
+        let first = try await fixture.client.plan(transcript: steps[0], applications: [app], currentApplicationID: nil)
+        XCTAssertEqual(first.intent, .openApp)
+        XCTAssertEqual(first.applicationID, app.id)
+        let second = try await fixture.client.plan(transcript: steps[1], applications: [app], currentApplicationID: first.applicationID)
+        XCTAssertEqual(second.intent, .clickElement)
+        XCTAssertEqual(second.applicationID, app.id)
+        XCTAssertTrue(SpeechVocabulary.build(applications: [app], currentApplicationID: nil).terms.contains("腾讯会议"))
+    }
+
+    func testMeetingGoalCanSelectOnlyAFreshObservedControl() async throws {
+        let fixture = JevHTTPFixture { request in
+            let body = try Self.body(request)
+            XCTAssertEqual((body["state"] as? [String: String])?["user_goal"], "创建一个新的会议")
+            let questions = try XCTUnwrap(body["questions"] as? [String: [String: Any]])
+            let criteria = try XCTUnwrap(questions["element"]?["criteria"] as? [String: String])
+            let observed = try XCTUnwrap(criteria.first { $0.value == "新会议" }?.key)
+            return (200, try Self.answer(request, choices: ["element": observed]))
+        }
+        defer { fixture.close() }
+        let selected = try await fixture.client.chooseElement(goal: "创建一个新的会议", elements: ["new-meeting": "新会议", "join": "加入会议"])
+        XCTAssertEqual(selected, "new-meeting")
+    }
+
     func testInstalledApplicationAliasesAreSharedWithIndependentActionQuestion() async throws {
         let fixture = JevHTTPFixture { request in
             let state = try XCTUnwrap(Self.body(request)["state"] as? [String: String])

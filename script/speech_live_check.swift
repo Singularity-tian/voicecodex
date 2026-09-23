@@ -1,6 +1,7 @@
 // Opt-in live integration check. Receives only fixed synthetic audio fixtures.
 // Run with script/test_speech_live.sh --live; no microphone or desktop input.
 // Add --vocabulary-ab for paired app-name context checks, or --filter FIXTURE_ID.
+// --endpoints checks two utterances in one Soniox stream without Jev requests.
 // Offline configuration check: .build/qa/speech-live-check --check-config
 // A nonexistent VOICECODEX_ENV_FILE must make this check exit 2 before any request.
 import AVFoundation
@@ -120,6 +121,28 @@ struct SpeechLiveCheck {
         }
     }
 
+    private struct UtteranceObservation: Codable {
+        let text: String
+        let milliseconds: Int
+        let beforeEOF: Bool
+    }
+
+    private struct EndpointReport: Codable {
+        let generatedAt: String
+        let scope: String
+        let sonioxModel: String
+        let expectedUtterances: [String]
+        let utterances: [UtteranceObservation]
+        let finalTranscript: String?
+        let finalCallbacks: [String]
+        let firstUtteranceBeforeEOF: Bool
+        let utterancesDeliveredExactlyOnce: Bool
+        let fullTranscriptHasNoDuplicates: Bool
+        let repeatedFinishPreservedResult: Bool
+        let passed: Bool
+        let error: String?
+    }
+
     private enum HarnessFailure: Error {
         case setup, invalidAudio, queueOverflow, speechTimeout
     }
@@ -170,6 +193,11 @@ struct SpeechLiveCheck {
             return
         }
         let vocabularyAB = CommandLine.arguments.contains("--vocabulary-ab")
+        let endpoints = CommandLine.arguments.contains("--endpoints")
+        guard !endpoints || (!vocabularyAB && !CommandLine.arguments.contains("--filter")) else {
+            print("--endpoints cannot be combined with --vocabulary-ab or --filter. No requests made.")
+            exit(2)
+        }
         let filter: String?
         if let index = CommandLine.arguments.firstIndex(of: "--filter") {
             guard CommandLine.arguments.indices.contains(index + 1),
@@ -182,13 +210,18 @@ struct SpeechLiveCheck {
         let output = URL(fileURLWithPath: ".build/qa/\(outputName)\(filter.map { "-" + $0 } ?? "")-results.json")
         do {
             let credentials = try loadCredentials()
-            guard !credentials.soniox.isEmpty, !credentials.jev.isEmpty else {
-                print("Missing local SONIOX_API_KEY or TYPESAFE_API_KEY. No requests made.")
+            guard !credentials.soniox.isEmpty, endpoints || !credentials.jev.isEmpty else {
+                print(endpoints ? "Missing local SONIOX_API_KEY. No requests made." :
+                    "Missing local SONIOX_API_KEY or TYPESAFE_API_KEY. No requests made.")
                 exit(2)
             }
             if checkConfiguration {
                 print("Local credentials loaded. No requests made.")
                 return
+            }
+            if endpoints {
+                let passed = try await runEndpointCheck(credentials: credentials)
+                exit(passed ? 0 : 1)
             }
             let inventory = vocabularyAB ? MacControlDriver().applications().filter { $0.id != "com.singularity.voicecodex" } : applications
             let vocabulary = vocabularyAB ? SpeechVocabulary.build(applications: inventory, currentApplicationID: "com.apple.finder") : nil
@@ -234,6 +267,85 @@ struct SpeechLiveCheck {
             print("Could not read local credentials or synthetic fixtures, or save the test report.")
             exit(2)
         }
+    }
+
+    @MainActor
+    private static func runEndpointCheck(credentials: Credentials) async throws -> Bool {
+        let expected = ["Open Google Chrome", "Open Calculator"]
+        let fixtures = try ["en-chrome", "en-calculator"].map {
+            try loadAudio(URL(fileURLWithPath: ".build/qa/speech-live-audio/\($0).aiff"))
+        }
+        let connection = SonioxConnection()
+        defer { connection.cancel() }
+        let started = Date()
+        var eofRequested = false
+        var observations: [UtteranceObservation] = []
+        var finalCallbacks: [String] = []
+        var finalTranscript: String?
+        var repeatedFinishPreservedResult = false
+        var failure: String?
+        connection.onUtterance = { text in
+            observations.append(UtteranceObservation(text: text,
+                milliseconds: Int(Date().timeIntervalSince(started) * 1_000), beforeEOF: !eofRequested))
+        }
+        connection.onTranscript = { text, final in if final { finalCallbacks.append(text) } }
+        var timedOut = false
+        let deadline = Task { @MainActor in
+            do { try await Task.sleep(nanoseconds: 35_000_000_000) }
+            catch { return }
+            timedOut = true
+            connection.cancel()
+        }
+        defer { deadline.cancel() }
+        do {
+            try await connection.start(apiKey: credentials.soniox)
+            for (index, audio) in fixtures.enumerated() {
+                for chunk in audio.chunks {
+                    if timedOut { throw HarnessFailure.speechTimeout }
+                    try yield(chunk, into: connection)
+                    try await Task.sleep(nanoseconds: UInt64(audio.durationPerChunk * 1_000_000_000))
+                }
+                // Stream actual zero PCM, rather than merely waiting without
+                // audio. The first pause must produce an endpoint before EOF;
+                // the short final pause also exercises any successful EOF tail.
+                let silenceChunks = index == 0 ? 150 : 8
+                for _ in 0..<silenceChunks {
+                    if timedOut { throw HarnessFailure.speechTimeout }
+                    try yield(Data(repeating: 0, count: 640), into: connection)
+                    try await Task.sleep(nanoseconds: 20_000_000)
+                }
+            }
+            eofRequested = true
+            finalTranscript = try await connection.finish()
+            let countBeforeRepeatedFinish = observations.count
+            let repeated = try await connection.finish()
+            repeatedFinishPreservedResult = repeated == finalTranscript && observations.count == countBeforeRepeatedFinish
+        } catch { failure = safeError(error) }
+        deadline.cancel()
+        let normalizedExpected = expected.map(normalizeAppName)
+        let deliveredOnce = observations.map { normalizeAppName($0.text) } == normalizedExpected
+        let noDuplicates = finalTranscript.map(normalizeAppName) == normalizedExpected.joined()
+        let firstBeforeEOF = observations.first?.beforeEOF == true
+        let passed = failure == nil && firstBeforeEOF && deliveredOnce && noDuplicates &&
+            repeatedFinishPreservedResult && finalCallbacks.count == 1 && finalCallbacks.first == finalTranscript
+        let report = EndpointReport(generatedAt: ISO8601DateFormatter().string(from: Date()),
+            scope: "Two fixed synthetic clips separated by three seconds of streamed silence; production PCM encoding and Soniox connection. No microphone, Jev request, hotkey, accessibility or desktop action.",
+            sonioxModel: SonioxConnection.model, expectedUtterances: expected, utterances: observations,
+            finalTranscript: finalTranscript, finalCallbacks: finalCallbacks, firstUtteranceBeforeEOF: firstBeforeEOF,
+            utterancesDeliveredExactlyOnce: deliveredOnce, fullTranscriptHasNoDuplicates: noDuplicates,
+            repeatedFinishPreservedResult: repeatedFinishPreservedResult, passed: passed, error: failure)
+        let output = URL(fileURLWithPath: ".build/qa/speech-endpoints-results.json")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(report).write(to: output, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: output.path)
+        print("\(passed ? "PASS" : "FAIL") live Soniox endpoints: first before EOF=\(firstBeforeEOF), ordered once=\(deliveredOnce), full transcript once=\(noDuplicates), final callbacks=\(finalCallbacks.count).")
+        for observation in observations {
+            print("\(observation.milliseconds)ms [\(observation.beforeEOF ? "before EOF" : "finishing")]: \(observation.text)")
+        }
+        if let failure { print("Endpoint check failed: \(failure)") }
+        print("Report: .build/qa/speech-endpoints-results.json. No microphone or desktop actions exercised.")
+        return passed
     }
 
     @MainActor

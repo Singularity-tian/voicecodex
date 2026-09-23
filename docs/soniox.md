@@ -26,3 +26,10 @@ References:
 - [Soniox supported languages](https://soniox.com/docs/stt/concepts/supported-languages)
 - [Soniox language hints](https://soniox.com/docs/stt/concepts/language-hints)
 - [Soniox context and vocabulary limits](https://soniox.com/docs/stt/concepts/context)
+
+
+## Execute during speech
+
+Mac mode defaults to **边说边做**. Soniox's [semantic endpoint detection](https://soniox.com/docs/stt/rt/endpoint-detection) produces a final `<end>` after the preceding tokens are committed. `onUtterance` emits each nonempty confirmed segment in order, and a successful locally requested EOF emits the remaining confirmed tail once. Partial tokens remain display-only. `<fin>` alone never triggers an action, and cancellation, server errors, unexpected EOF, or a timeout never flush pending text. Existing `onTranscript` and full `finish()` remain available for coding mode and release-to-execute mode.
+
+This is sentence-level execution during an explicit held recording, not an always-on microphone or execution of every provisional word. Default semantic endpoint settings are retained to avoid aggressive mid-sentence splits.

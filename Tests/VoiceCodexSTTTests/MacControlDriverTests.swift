@@ -100,6 +100,18 @@ final class MacControlDriverTests: XCTestCase {
             identifier: nil, roleDescription: "终端"))
     }
 
+    func testControlRolesWithoutActualLabelsDoNotBlockVisualFallback() {
+        XCTAssertNil(MacControlDriver.controlLabel(role: kAXButtonRole, title: nil, description: nil))
+        XCTAssertNil(MacControlDriver.controlLabel(role: kAXButtonRole, title: " \n ", description: "\t"))
+    }
+
+    func testControlLabelsRetainLocalizedTitleOrAccessibilityDescription() {
+        XCTAssertEqual(MacControlDriver.controlLabel(role: kAXButtonRole, title: " 快速会议 ", description: nil),
+                       "AXButton · 快速会议")
+        XCTAssertEqual(MacControlDriver.controlLabel(role: kAXButtonRole, title: "", description: " Create meeting "),
+                       "AXButton · Create meeting")
+    }
+
     @MainActor
     func testStopQueuedDuringSynchronousInspectionPreventsThePendingWrite() async throws {
         var stopDelivered = false

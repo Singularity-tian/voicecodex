@@ -35,6 +35,7 @@ public enum MacApplicationAliases {
         "com.apple.iwork.pages": ["Pages"],
         "com.apple.dt.xcode": ["Xcode"],
         "com.tencent.xinwechat": ["WeChat", "微信"],
+        "com.tencent.meeting": ["Tencent Meeting", "TencentMeeting", "腾讯会议"],
         "com.electron.lark": ["Feishu", "Lark", "飞书"],
         "com.microsoft.vscode": ["Visual Studio Code", "VS Code", "VSCode"],
         "com.todesktop.230313mzl4w4u92": ["Cursor"],

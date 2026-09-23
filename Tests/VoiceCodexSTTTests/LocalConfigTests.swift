@@ -3,6 +3,20 @@ import XCTest
 @testable import VoiceCodex
 
 final class LocalConfigTests: XCTestCase {
+    func testLiveExecutionDefaultAndSavedOptOutSurviveCredentialReload() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        XCTAssertTrue(fixture.load().liveMacExecution)
+        var saved = LocalConfig()
+        saved.liveMacExecution = false
+        try saved.save(directory: fixture.support)
+        var loaded = fixture.load()
+        XCTAssertFalse(loaded.liveMacExecution)
+        loaded.liveMacExecution = true
+        loaded.reloadCredentials(environment: [:], directory: fixture.support, currentDirectory: fixture.cwd)
+        XCTAssertTrue(loaded.liveMacExecution)
+    }
+
     func testCredentialPrecedenceAndSavedSessionPreservation() throws {
         let fixture = try Fixture()
         defer { fixture.remove() }
