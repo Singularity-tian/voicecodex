@@ -4,7 +4,7 @@ umask 077
 
 if [[ "${1:-}" != "--live" || $# != 1 ]]; then
   echo "Usage: $0 --live"
-  echo "Sends three fixed synthetic speech clips to Soniox, then their transcripts to TypeSafe."
+  echo "Sends five fixed synthetic speech clips to Soniox, then their transcripts to TypeSafe."
   echo "Uses local credentials; never records the microphone or operates desktop apps."
   exit 2
 fi
@@ -18,6 +18,8 @@ mkdir -p .build/qa/speech-live-audio
 /usr/bin/say -v Samantha -r 150 -o .build/qa/speech-live-audio/en-calculator.aiff 'Open Calculator'
 /usr/bin/say -v Samantha -r 150 -o .build/qa/speech-live-audio/en-chrome.aiff 'Open Google Chrome'
 /usr/bin/say -v Tingting -r 150 -o .build/qa/speech-live-audio/zh-calculator.aiff '打开计算器'
+/usr/bin/say -v Samantha -r 150 -o .build/qa/speech-live-audio/en-type.aiff 'Type hello world'
+/usr/bin/say -v Tingting -r 150 -o .build/qa/speech-live-audio/zh-type.aiff '输入你好世界'
 
 # Compile production sources directly, without taking the SwiftPM build lock.
 xcrun swiftc -parse-as-library \

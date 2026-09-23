@@ -11,6 +11,24 @@ struct SpeechLiveCheck {
         let id: String
         let phrase: String
         let target: String
+        let intent: MacIntent
+        let current: String
+        let acceptedText: [String]
+
+        init(id: String, phrase: String, target: String, intent: MacIntent = .openApp,
+             current: String = "com.apple.finder", acceptedText: [String] = []) {
+            self.id = id
+            self.phrase = phrase
+            self.target = target
+            self.intent = intent
+            self.current = current
+            self.acceptedText = acceptedText
+        }
+
+        var expected: String {
+            "\(intent.rawValue) → \(target)" +
+                (acceptedText.isEmpty ? "" : " text∈\(acceptedText.map(\.debugDescription).joined(separator: " | "))")
+        }
     }
 
     private struct Result: Codable {
@@ -68,7 +86,15 @@ struct SpeechLiveCheck {
     private static let scenarios: [Scenario] = [
         .init(id: "en-calculator", phrase: "Open Calculator", target: "com.apple.calculator"),
         .init(id: "en-chrome", phrase: "Open Google Chrome", target: "com.google.Chrome"),
-        .init(id: "zh-calculator", phrase: "打开计算器", target: "com.apple.calculator")
+        .init(id: "zh-calculator", phrase: "打开计算器", target: "com.apple.calculator"),
+        // Expected literals are independent of the production parser. Speech does
+        // not specify letter case: Soniox has formatted this fixed English clip
+        // as "Hello World.". Allow only these explicit casing/terminal-punctuation
+        // variants; do not normalize the returned text or promise lowercase output.
+        .init(id: "en-type", phrase: "Type hello world", target: "com.apple.TextEdit", intent: .typeText,
+              current: "com.apple.TextEdit", acceptedText: ["hello world", "hello world.", "Hello World", "Hello World."]),
+        .init(id: "zh-type", phrase: "输入你好世界", target: "com.apple.TextEdit", intent: .typeText,
+              current: "com.apple.TextEdit", acceptedText: ["你好世界", "你好世界。", "你好世界."])
     ]
     private static let applications = [
         MacApplication(id: "com.apple.calculator", name: "Calculator"),
@@ -166,20 +192,23 @@ struct SpeechLiveCheck {
             stage = "planning"
             let planStarted = Date()
             let command = try await jev.plan(transcript: transcript, applications: applications,
-                                             currentApplicationID: "com.apple.finder")
+                                             currentApplicationID: scenario.current)
             planMilliseconds = Int(Date().timeIntervalSince(planStarted) * 1_000)
-            let passed = command.intent == .openApp && command.applicationID == scenario.target && command.text == nil
+            let textMatches = scenario.acceptedText.isEmpty ? command.text == nil :
+                command.text.map { scenario.acceptedText.contains($0) } == true
+            let passed = command.intent == scenario.intent && command.applicationID == scenario.target && textMatches
             return Result(id: scenario.id, phrase: scenario.phrase, transcript: transcript,
                           confirmedFinalCallback: finalCallback, passed: passed, sourceSampleRate: sourceRate,
                           pcmBytes: pcmBytes, transcriptionMilliseconds: sttMilliseconds,
-                          planningMilliseconds: planMilliseconds, expected: "openApp → \(scenario.target)",
-                          observed: "\(command.intent.rawValue) → \(command.applicationID ?? "none")",
+                          planningMilliseconds: planMilliseconds, expected: scenario.expected,
+                          observed: "\(command.intent.rawValue) → \(command.applicationID ?? "none")" +
+                            (command.text.map { " text=\($0.debugDescription)" } ?? ""),
                           confidence: command.confidence)
         } catch {
             return Result(id: scenario.id, phrase: scenario.phrase, transcript: transcript,
                           confirmedFinalCallback: finalCallback, passed: false, sourceSampleRate: sourceRate,
                           pcmBytes: pcmBytes, transcriptionMilliseconds: sttMilliseconds,
-                          planningMilliseconds: planMilliseconds, expected: "openApp → \(scenario.target)",
+                          planningMilliseconds: planMilliseconds, expected: scenario.expected,
                           observed: "\(stage): \(safeError(error))", confidence: nil)
         }
     }
