@@ -4,7 +4,7 @@
 
 A native macOS voice controller with two modes: **Jev** selects native Mac actions, and **Codex** continues your coding session in Terminal. Soniox provides live Chinese / English transcription. Hold the shortcut from another app and release to execute.
 
-![VoiceCodex](docs/screenshot.png)
+![VoiceCodex](docs/screenshot.jpg)
 
 ## Control your Mac with Jev
 
