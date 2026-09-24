@@ -146,14 +146,23 @@ final class MacControlDriver {
     func waitForInterface(command: MacCommand) async throws {
         guard let id = command.applicationID ?? foregroundApplicationID else { throw MacControlError.noTarget }
         let deadline = Date().addingTimeInterval(3)
+        var sawWindow = false
         repeat {
             try Task.checkCancellation()
             guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: id).first(where: { !$0.isTerminated }) else {
                 throw MacControlError.applicationNotRunning
             }
-            if elementAttribute(applicationElement(app), kAXFocusedWindowAttribute) != nil { return }
+            let ax = applicationElement(app)
+            if elementAttribute(ax, kAXFocusedWindowAttribute) != nil {
+                sawWindow = true
+                // During launch, AX may expose a window before its child
+                // attributes respond. Give the dialog check time to settle;
+                // a transient timeout must not immediately look like a modal.
+                if !hasBlockingDialog(ax) { return }
+            }
             try await Task.sleep(nanoseconds: 150_000_000)
         } while Date() < deadline
+        if sawWindow { throw MacControlError.blockedByDialog }
         throw MacControlError.noWindow
     }
 
