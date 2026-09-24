@@ -29,6 +29,16 @@ final class VisualControlObserver {
         let text: String
         /// Top-left origin, normalized to the window without its drop shadow.
         let normalizedBox: CGRect
+        /// A locally observed colored tile associated one-to-one with the label.
+        /// The OCR box remains separate for label identity and revalidation.
+        let activationBox: CGRect?
+
+        init(id: String, text: String, normalizedBox: CGRect, activationBox: CGRect? = nil) {
+            self.id = id
+            self.text = text
+            self.normalizedBox = normalizedBox
+            self.activationBox = activationBox
+        }
     }
 
     struct Snapshot: Sendable {
@@ -100,7 +110,7 @@ final class VisualControlObserver {
 
         // Vision work runs away from the main actor so Escape/Stop stays usable.
         // A cancelled result is discarded; no native input exists in this class.
-        let recognition = Task.detached(priority: .userInitiated) { () throws -> [TextObservation] in
+        let recognition = Task.detached(priority: .userInitiated) { () throws -> ([TextObservation], [CGRect]) in
             try Task.checkCancellation()
             let request = VNRecognizeTextRequest()
             request.recognitionLevel = .accurate
@@ -111,7 +121,7 @@ final class VisualControlObserver {
                 try VNImageRequestHandler(cgImage: screenshot, options: [:]).perform([request])
             } catch { throw VisualControlError.recognitionFailed }
             try Task.checkCancellation()
-            return (request.results ?? []).compactMap { observation in
+            let observations = (request.results ?? []).compactMap { observation -> TextObservation? in
                 guard let text = observation.topCandidates(1).first else { return nil }
                 let raw = text.string
                 let contentRange = Self.labelContentRange(in: raw)
@@ -125,12 +135,15 @@ final class VisualControlObserver {
                 return TextObservation(text: raw, confidence: text.confidence,
                                        visionBox: contentBox ?? observation.boundingBox)
             }
+            let tiles = Self.activationTiles(in: screenshot, bounds: bounds)
+            try Task.checkCancellation()
+            return (observations, tiles)
         }
-        let observations = try await withTaskCancellationHandler {
+        let (observations, tiles) = try await withTaskCancellationHandler {
             try await recognition.value
         } onCancel: { recognition.cancel() }
         try Task.checkCancellation()
-        let candidates = Self.candidates(from: observations, bounds: bounds)
+        let candidates = Self.candidates(from: observations, bounds: bounds, activationTiles: tiles)
         guard !candidates.isEmpty else { throw VisualControlError.noText }
         return Snapshot(processID: processID, windowID: windowID, bounds: bounds, candidates: candidates)
     }
@@ -150,7 +163,8 @@ final class VisualControlObserver {
         return matches[0].windowID
     }
 
-    nonisolated static func candidates(from observations: [TextObservation], bounds: CGRect) -> [Candidate] {
+    nonisolated static func candidates(from observations: [TextObservation], bounds: CGRect,
+                                       activationTiles: [CGRect] = []) -> [Candidate] {
         guard validBounds(bounds) else { return [] }
         let usable: [(String, CGRect)] = observations.compactMap { observation in
             // Vision assigns 0.3 to readable meeting labels when an adjacent
@@ -175,8 +189,17 @@ final class VisualControlObserver {
         // duplicate below the first 60 rows must not make an earlier one appear
         // unique merely because the duplicate was truncated.
         let counts = Dictionary(grouping: usable, by: { labelIdentity($0.0) }).mapValues(\.count)
-        return usable.filter { counts[labelIdentity($0.0)] == 1 }.prefix(60).enumerated().map {
-            Candidate(id: "visual_\($0.offset + 1)", text: $0.element.0, normalizedBox: $0.element.1)
+        let tiles = activationTiles.filter { validNormalizedBox($0) }
+        return usable.filter { counts[labelIdentity($0.0)] == 1 }.prefix(60).enumerated().map { index, label in
+            let nearby = tiles.filter { tileIsAboveLabel($0, label: label.1, bounds: bounds) }
+            // Both directions must be unique, including labels beyond the cap.
+            // A nearby icon is evidence only when its label association is clear.
+            let activation: CGRect?
+            if let tile = nearby.first, nearby.count == 1,
+               usable.filter({ tileIsAboveLabel(tile, label: $0.1, bounds: bounds) }).count == 1 {
+                activation = tile
+            } else { activation = nil }
+            return Candidate(id: "visual_\(index + 1)", text: label.0, normalizedBox: label.1, activationBox: activation)
         }
     }
 
@@ -184,8 +207,11 @@ final class VisualControlObserver {
         guard snapshot.candidates.contains(candidate), validBounds(snapshot.bounds), validNormalizedBox(candidate.normalizedBox),
               candidate.normalizedBox.width * snapshot.bounds.width >= 6,
               candidate.normalizedBox.height * snapshot.bounds.height >= 6 else { return nil }
-        return CGPoint(x: snapshot.bounds.minX + candidate.normalizedBox.midX * snapshot.bounds.width,
-                       y: snapshot.bounds.minY + candidate.normalizedBox.midY * snapshot.bounds.height)
+        let target = candidate.activationBox ?? candidate.normalizedBox
+        guard validNormalizedBox(target), target.width * snapshot.bounds.width >= 6,
+              target.height * snapshot.bounds.height >= 6 else { return nil }
+        return CGPoint(x: snapshot.bounds.minX + target.midX * snapshot.bounds.width,
+                       y: snapshot.bounds.minY + target.midY * snapshot.bounds.height)
     }
 
     /// Exact window identity/frame and a unique label are mandatory. The same
@@ -200,11 +226,15 @@ final class VisualControlObserver {
         let matches = current.candidates.filter { labelIdentity($0.text) == labelIdentity(selected.text) }
         guard matches.count == 1, let fresh = matches.first,
               screenPoint(for: selected, in: previous) != nil, screenPoint(for: fresh, in: current) != nil else { return nil }
-        let a = selected.normalizedBox, b = fresh.normalizedBox
-        guard abs(a.minX - b.minX) * current.bounds.width <= 8,
-              abs(a.maxX - b.maxX) * current.bounds.width <= 8,
-              abs(a.minY - b.minY) * current.bounds.height <= 8,
-              abs(a.maxY - b.maxY) * current.bounds.height <= 8 else { return nil }
+        guard boxesAgree(selected.normalizedBox, fresh.normalizedBox, bounds: current.bounds) else { return nil }
+        switch (selected.activationBox, fresh.activationBox) {
+        case (.none, .none): break
+        case let (.some(old), .some(new)):
+            guard boxesAgree(old, new, bounds: current.bounds) else { return nil }
+        default:
+            // Never silently switch between a label and an icon after selection.
+            return nil
+        }
         return fresh
     }
 
@@ -221,15 +251,110 @@ final class VisualControlObserver {
         while start < end, text[start].isWhitespace { start = text.index(after: start) }
         while start < end, text[text.index(before: end)].isWhitespace { end = text.index(before: end) }
         let trimmedEnd = end
-        let chevrons: Set<Character> = ["丶", "~", "～", "⌄", "⌃", "﹀", "∨", "⌵", "▾", "▿", "▼", "˅"]
+        let chevrons: Set<Character> = ["丶", "丷", "~", "～", "⌄", "⌃", "﹀", "∨", "⌵", "▾", "▿", "▼", "˅"]
         while start < end {
             let last = text.index(before: end)
             guard chevrons.contains(text[last]) || text[last].isWhitespace else { break }
             end = last
         }
+        // Vision also reads a dropdown chevron as ASCII v/V after Chinese
+        // labels. Only strip one after at least two Han characters, immediately
+        // following Han; English names such as Dev or Rev remain literal.
+        if start < end {
+            let last = text.index(before: end)
+            if text[last] == "v" || text[last] == "V",
+               String(text[start..<last]).range(of: #"\p{Han}.*\p{Han}$"#, options: .regularExpression) != nil {
+                end = last
+            }
+        }
         // Do not normalize symbols or numeric fields such as 1~ into a target.
         let letters = text[start..<end].unicodeScalars.filter { CharacterSet.letters.contains($0) }.count
         return start..<(letters >= 2 ? end : trimmedEnd)
+    }
+
+    /// Finds compact colored components in this window image. This is pixel
+    /// evidence, not a guessed offset above text; the label association is made
+    /// separately. Neutral controls keep the existing OCR-label fallback.
+    nonisolated static func activationTiles(in image: CGImage, bounds: CGRect) -> [CGRect] {
+        guard validBounds(bounds), image.width > 0, image.height > 0 else { return [] }
+        let reduction = min(1, 1_024 / CGFloat(max(image.width, image.height)))
+        let width = max(1, Int((CGFloat(image.width) * reduction).rounded()))
+        let height = max(1, Int((CGFloat(image.height) * reduction).rounded()))
+        // Do not infer a small target from a severely downsampled capture.
+        guard bounds.width / CGFloat(width) <= 3, bounds.height / CGFloat(height) <= 3 else { return [] }
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        let rendered = pixels.withUnsafeMutableBytes { storage -> Bool in
+            guard let context = CGContext(data: storage.baseAddress, width: width, height: height,
+                                          bitsPerComponent: 8, bytesPerRow: width * 4,
+                                          space: CGColorSpaceCreateDeviceRGB(),
+                                          bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue) else { return false }
+            context.setFillColor(CGColor(gray: 1, alpha: 1))
+            context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+            context.interpolationQuality = .medium
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard rendered else { return [] }
+        var mask = [UInt8](repeating: 0, count: width * height)
+        for index in mask.indices {
+            let offset = index * 4
+            let maximum = Int(max(pixels[offset], pixels[offset + 1], pixels[offset + 2]))
+            let minimum = Int(min(pixels[offset], pixels[offset + 1], pixels[offset + 2]))
+            // Color-independent saturation: blue, green, red, etc. are equal.
+            if maximum >= 90, maximum - minimum >= 70, 2 * (maximum - minimum) >= maximum {
+                mask[index] = 1
+            }
+        }
+        var components: [CGRect] = []
+        var pending: [Int] = []
+        for seed in mask.indices where mask[seed] == 1 {
+            mask[seed] = 0
+            pending.append(seed)
+            var count = 0, minX = width, maxX = 0, minY = height, maxY = 0
+            while let index = pending.popLast() {
+                let x = index % width, y = index / width
+                count += 1
+                minX = min(minX, x); maxX = max(maxX, x)
+                minY = min(minY, y); maxY = max(maxY, y)
+                func append(_ neighbor: Int) {
+                    if mask[neighbor] == 1 { mask[neighbor] = 0; pending.append(neighbor) }
+                }
+                if x > 0 { append(index - 1) }
+                if x + 1 < width { append(index + 1) }
+                if y > 0 { append(index - width) }
+                if y + 1 < height { append(index + width) }
+            }
+            let pixelWidth = maxX - minX + 1, pixelHeight = maxY - minY + 1
+            let pointWidth = CGFloat(pixelWidth) / CGFloat(width) * bounds.width
+            let pointHeight = CGFloat(pixelHeight) / CGFloat(height) * bounds.height
+            let largestSide = min(240, min(bounds.width, bounds.height) * 0.35)
+            // Rounded backgrounds may contain white glyph holes; thin glyphs,
+            // separators, large banners and highly elongated shapes are excluded.
+            guard min(pointWidth, pointHeight) >= 24, max(pointWidth, pointHeight) <= largestSide,
+                  pointWidth / pointHeight >= 0.65, pointWidth / pointHeight <= 1.55,
+                  Double(count) / Double(pixelWidth * pixelHeight) >= 0.65 else { continue }
+            components.append(CGRect(x: CGFloat(minX) / CGFloat(width), y: CGFloat(minY) / CGFloat(height),
+                                     width: CGFloat(pixelWidth) / CGFloat(width), height: CGFloat(pixelHeight) / CGFloat(height)))
+            // Exceeding the bound is an ambiguous/dense image, not permission to
+            // discard later components and make an earlier label appear unique.
+            if components.count > 120 { return [] }
+        }
+        return components
+    }
+
+    nonisolated private static func tileIsAboveLabel(_ tile: CGRect, label: CGRect, bounds: CGRect) -> Bool {
+        let tileWidth = tile.width * bounds.width, tileHeight = tile.height * bounds.height
+        let labelWidth = label.width * bounds.width, labelHeight = label.height * bounds.height
+        let gap = (label.minY - tile.maxY) * bounds.height
+        return gap >= -1 && gap <= min(36, labelHeight * 1.6)
+            && tileWidth >= labelWidth * 0.6 && tileWidth <= labelWidth * 2.5
+            && tileHeight >= labelHeight * 2 && tileHeight <= labelHeight * 8
+            && abs(tile.midX - label.midX) * bounds.width <= min(tileWidth, labelWidth) * 0.2
+    }
+
+    nonisolated private static func boxesAgree(_ a: CGRect, _ b: CGRect, bounds: CGRect) -> Bool {
+        abs(a.minX - b.minX) * bounds.width <= 8 && abs(a.maxX - b.maxX) * bounds.width <= 8
+            && abs(a.minY - b.minY) * bounds.height <= 8 && abs(a.maxY - b.maxY) * bounds.height <= 8
     }
 
     nonisolated private static func validNormalizedBox(_ box: CGRect) -> Bool {

@@ -412,6 +412,181 @@ final class MacControlDriverTests: XCTestCase {
         ])
     }
 
+    @MainActor
+    func testNoOpClickStopsAfterOneDispatchAndBoundedReads() async throws {
+        var writes = 0, reads = 0
+        do {
+            try await MacControlDriver.performVerifiedClick(baseline: "home", attempts: 4,
+                action: { writes += 1 }, observe: { reads += 1; return "home" },
+                evidence: { $0 == $1 ? nil : $1 }, wait: {})
+            XCTFail("An accepted native press does not prove it affected the UI")
+        } catch MacControlError.incomplete(let message) {
+            XCTAssertTrue(message.contains("没有观察到界面内容变化"))
+            XCTAssertTrue(message.contains("后续步骤已停止"))
+        }
+        XCTAssertEqual(writes, 1)
+        XCTAssertEqual(reads, 4)
+    }
+
+    @MainActor
+    func testDelayedClickEffectNeedsTwoStableReadsAndNeverRedispatches() async throws {
+        var writes = 0, reads = 0
+        let states: [String?] = [nil, "home", "form", "form"]
+        try await MacControlDriver.performVerifiedClick(baseline: "home", attempts: 6,
+            action: { writes += 1 }, observe: { defer { reads += 1 }; return states[reads] },
+            evidence: { $0 == $1 ? nil : $1 }, wait: {})
+        XCTAssertEqual(writes, 1)
+        XCTAssertEqual(reads, 4)
+    }
+
+    @MainActor
+    func testTransientChangeFollowedByUnreadableFrameCannotVerifyClick() async throws {
+        var reads = 0, writes = 0
+        let states: [String?] = ["form", nil, "form", "home"]
+        do {
+            try await MacControlDriver.performVerifiedClick(baseline: "home", attempts: states.count,
+                action: { writes += 1 }, observe: { defer { reads += 1 }; return states[reads] },
+                evidence: { $0 == $1 ? nil : $1 }, wait: {})
+            XCTFail("Isolated changed frames are not a stable result")
+        } catch MacControlError.incomplete {}
+        XCTAssertEqual(writes, 1)
+    }
+
+    @MainActor
+    func testUnreadableClickResultIsUnknownNotSuccessOrAnEmptyScreen() async throws {
+        var writes = 0, reads = 0
+        do {
+            try await MacControlDriver.performVerifiedClick(baseline: "home", attempts: 3,
+                action: { writes += 1 }, observe: { reads += 1; return nil as String? },
+                evidence: { $0 == $1 ? nil : $1 }, wait: {})
+            XCTFail("Unreadable is not changed")
+        } catch MacControlError.incomplete(let message) {
+            XCTAssertTrue(message.contains("结果未知"))
+        }
+        XCTAssertEqual(writes, 1)
+        XCTAssertEqual(reads, 3)
+    }
+
+    @MainActor
+    func testClickWithNoBaselineNeverDispatches() async throws {
+        var writes = 0
+        do {
+            try await MacControlDriver.performVerifiedClick(baseline: nil as String?, action: { writes += 1 },
+                observe: { "home" }, evidence: { $0 == $1 ? nil : $1 }, wait: {})
+            XCTFail("A baseline is required")
+        } catch MacControlError.incomplete(let message) { XCTAssertTrue(message.contains("未执行点击")) }
+        XCTAssertEqual(writes, 0)
+    }
+
+    @MainActor
+    func testCancelledClickVerificationDoesNotSendAnotherInput() async throws {
+        var writes = 0, reads = 0
+        do {
+            try await MacControlDriver.performVerifiedClick(baseline: "home", action: { writes += 1 },
+                observe: { reads += 1; return "form" }, evidence: { $0 == $1 ? nil : $1 },
+                wait: { throw CancellationError() })
+            XCTFail("Stop must interrupt observation")
+        } catch is CancellationError {}
+        XCTAssertEqual(writes, 1)
+        XCTAssertEqual(reads, 0)
+    }
+
+    @MainActor
+    func testFailedNativeClickIsNeverRetriedOrReportedAsAnObservedResult() async throws {
+        var writes = 0, reads = 0
+        do {
+            try await MacControlDriver.performVerifiedClick(baseline: "home", action: {
+                writes += 1
+                throw MacControlError.actionFailed
+            }, observe: { reads += 1; return "form" }, evidence: { $0 == $1 ? nil : $1 }, wait: {})
+            XCTFail("Native failure should propagate")
+        } catch MacControlError.actionFailed {}
+        XCTAssertEqual(writes, 1)
+        XCTAssertEqual(reads, 0)
+    }
+
+    @MainActor
+    func testOCRTooltipOrDisappearanceAloneDoesNotVerifyClick() {
+        let before = MacControlDriver.ClickState(visualLabels: ["快速会议", "预定会议", "暂无会议"])
+        XCTAssertNil(MacControlDriver.clickChange(before,
+            .init(visualLabels: ["快速会议", "预定会议", "暂无会议", "点击以创建会议"])))
+        XCTAssertNil(MacControlDriver.clickChange(before, .init(visualLabels: ["快速会议", "预定会议"])))
+        XCTAssertNil(MacControlDriver.clickChange(before, .init(visualLabels: ["快速会议", "预定会议", "暂无会议"])))
+        XCTAssertNotNil(MacControlDriver.clickChange(before, .init(visualLabels: ["会议主题", "开始时间", "预定"])))
+    }
+
+    @MainActor
+    func testOnlyReadableSemanticChangesCanVerifyClick() {
+        let before = MacControlDriver.ClickState(semantics: ["AXStaticText · Counter: 0"])
+        XCTAssertNil(MacControlDriver.clickChange(before, .init(semantics: nil)))
+        XCTAssertNil(MacControlDriver.clickChange(before, .init(semantics: [])))
+        XCTAssertNil(MacControlDriver.clickChange(before, .init(semantics: ["AXStaticText · Counter: 0"])))
+        XCTAssertNotNil(MacControlDriver.clickChange(before, .init(semantics: ["AXStaticText · Counter: 1"])))
+        XCTAssertNil(MacControlDriver.clickChange(before, .init(semantics: ["AXStaticText · Counter: 0", "Tooltip"])))
+    }
+
+    func testClockTicksCannotProvideSemanticClickEvidence() {
+        for clock in ["12:05", "00:04:32", " 3:04 PM "] { XCTAssertNil(MacControlDriver.stableClickText(clock)) }
+        XCTAssertEqual(MacControlDriver.stableClickText(" Counter: 1 "), "Counter: 1")
+        XCTAssertEqual(MacControlDriver.stableClickText("快速会议"), "快速会议")
+    }
+
+    @MainActor
+    func testFocusSwitchBetweenExistingWindowsIsNotClickProof() {
+        let a = AXUIElementCreateApplication(123), b = AXUIElementCreateApplication(456)
+        let before = MacControlDriver.ClickState(windows: [a, b], semantics: ["old"], contentWindow: a)
+        let after = MacControlDriver.ClickState(windows: [a, b], semantics: ["new"], contentWindow: b)
+        XCTAssertNil(MacControlDriver.clickChange(before, after))
+        XCTAssertNotNil(MacControlDriver.clickChange(before, .init(windows: [a, b, AXUIElementCreateApplication(789)])))
+    }
+
+    @MainActor
+    func testPlanningWaitsForLateWindowUsingOnlyBoundedReads() async {
+        var reads = 0, waits = 0
+        let start = Date(timeIntervalSince1970: 1_000)
+        let window = await MacControlDriver.waitForPlanningWindow(validTarget: { true }, read: {
+            reads += 1
+            return reads == 3 ? "ready" : nil
+        }, now: { start.addingTimeInterval(Double(waits) * 0.15) }, wait: { waits += 1 })
+        XCTAssertEqual(window, "ready")
+        XCTAssertEqual(reads, 3)
+        XCTAssertEqual(waits, 2)
+    }
+
+    @MainActor
+    func testPlanningWindowTimeoutIsBoundedAndDoesNotInventAWindow() async {
+        var reads = 0, waits = 0
+        let start = Date(timeIntervalSince1970: 1_000)
+        let window = await MacControlDriver.waitForPlanningWindow(validTarget: { true }, read: {
+            reads += 1
+            return nil as String?
+        }, now: { start.addingTimeInterval(Double(waits) * 0.15) }, wait: { waits += 1 })
+        XCTAssertNil(window)
+        XCTAssertLessThanOrEqual(reads, 20)
+        XCTAssertLessThanOrEqual(Double(waits) * 0.15, 3)
+    }
+
+    @MainActor
+    func testPlanningWindowFocusChangeDiscardsAJustReadWindow() async {
+        var stillTarget = true
+        let window = await MacControlDriver.waitForPlanningWindow(validTarget: { stillTarget }, read: {
+            stillTarget = false
+            return "wrong target"
+        }, wait: { XCTFail("Should stop before any wait") })
+        XCTAssertNil(window)
+    }
+
+    @MainActor
+    func testPlanningWindowCancellationStopsBeforeAnotherRead() async {
+        var reads = 0
+        let window = await MacControlDriver.waitForPlanningWindow(validTarget: { true }, read: {
+            reads += 1
+            return nil as String?
+        }, wait: { throw CancellationError() })
+        XCTAssertNil(window)
+        XCTAssertEqual(reads, 1)
+    }
+
     private static func delayedReadFixture() {
         Thread.sleep(forTimeInterval: 0.02)
     }

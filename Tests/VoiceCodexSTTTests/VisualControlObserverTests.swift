@@ -49,7 +49,7 @@ final class VisualControlObserverTests: XCTestCase {
         let selected = try XCTUnwrap(candidates.first)
         let original = snapshot(candidates)
         XCTAssertEqual(Observer.revalidatedCandidate(selected, from: original, in: original), selected)
-        for text in ["快速会议", "快速会议～", "快速会议 ~", "快速会议▾"] {
+        for text in ["快速会议", "快速会议～", "快速会议 ~", "快速会议▾", "快速会议丷", "快速会议v", "快速会议V"] {
             let changed = Observer.Candidate(id: selected.id, text: text, normalizedBox: selected.normalizedBox)
             XCTAssertEqual(Observer.revalidatedCandidate(selected, from: original, in: snapshot([changed])), changed)
         }
@@ -58,11 +58,16 @@ final class VisualControlObserverTests: XCTestCase {
     }
 
     func testChevronNormalizationPreservesNumbersInternalSymbolsAndMeaningfulPunctuation() {
-        for text in ["快速会议!", "快速会议?", "A~B", "Plan +", "Plan -", "1~", "1", "C++", "C#", "Name >", "丶"] {
+        for text in ["快速会议!", "快速会议?", "A~B", "Plan +", "Plan -", "1~", "1", "C++", "C#", "Name >", "丶", "Dev", "Rev", "Quick meetingv", "会v", "快速会议vv", "快速会议 V"] {
             XCTAssertEqual(Observer.labelIdentity(text), text)
         }
         XCTAssertEqual(Observer.labelIdentity("  快速会议 丶  "), "快速会议")
         XCTAssertEqual(Observer.labelIdentity("  Quick meeting ～  "), "Quick meeting")
+        XCTAssertEqual(Observer.labelIdentity("快速会议v"), "快速会议")
+        XCTAssertEqual(Observer.labelIdentity("快速会议V"), "快速会议")
+        let vLabel = candidate(text: "快速会议v")
+        let chevronLabel = candidate(text: "快速会议丷")
+        XCTAssertEqual(Observer.revalidatedCandidate(vLabel, from: snapshot([vLabel]), in: snapshot([chevronLabel])), chevronLabel)
         XCTAssertEqual(Observer.labelIdentity("  "), "")
         // Returned indices belong to the original string and can be passed to
         // Vision to bound the content without its adjacent dropdown glyph.
@@ -157,6 +162,123 @@ final class VisualControlObserverTests: XCTestCase {
         XCTAssertNil(Observer.screenPoint(for: forged, in: snapshot([selected])))
         let outside = Observer.Candidate(id: "bad", text: "bad", normalizedBox: CGRect(x: 1, y: 0, width: 0.1, height: 0.1))
         XCTAssertNil(Observer.screenPoint(for: outside, in: snapshot([outside])))
+    }
+
+    func testObservedColoredTileSuppliesItsCenterInsteadOfTheCaptionCenter() throws {
+        let tile = CGRect(x: 320, y: 120, width: 96, height: 96)
+        let label = CGRect(x: 320, y: 232, width: 96, height: 20)
+        let image = try tileImage(tiles: [tile])
+        let tiles = Observer.activationTiles(in: image, bounds: bounds)
+        XCTAssertEqual(tiles.count, 1)
+        let candidates = Observer.candidates(from: [observation("Tile action", box: label)], bounds: bounds, activationTiles: tiles)
+        let selected = try XCTUnwrap(candidates.first)
+        XCTAssertEqual(try XCTUnwrap(selected.activationBox).minY, 0.2, accuracy: 0.002)
+        let point = try XCTUnwrap(Observer.screenPoint(for: selected, in: snapshot(candidates)))
+        XCTAssertEqual(point.x, bounds.minX + tile.midX, accuracy: 1)
+        XCTAssertEqual(point.y, bounds.minY + tile.midY, accuracy: 1)
+        XCTAssertNotEqual(point.y, bounds.minY + label.midY)
+    }
+
+    func testTilePixelGeometryMapsTheSameAtRetinaAndOneTimesScale() throws {
+        let tile = CGRect(x: 320, y: 120, width: 96, height: 96)
+        let a = Observer.activationTiles(in: try tileImage(tiles: [tile], scale: 1), bounds: bounds)
+        let b = Observer.activationTiles(in: try tileImage(tiles: [tile], scale: 2), bounds: bounds)
+        let first = try XCTUnwrap(a.first), second = try XCTUnwrap(b.first)
+        XCTAssertEqual(a.count, 1)
+        XCTAssertEqual(b.count, 1)
+        XCTAssertEqual(first.midX * bounds.width, second.midX * bounds.width, accuracy: 1)
+        XCTAssertEqual(first.midY * bounds.height, second.midY * bounds.height, accuracy: 1)
+        XCTAssertEqual(first.width * bounds.width, second.width * bounds.width, accuracy: 2)
+    }
+
+    func testTileDetectorRejectsNeutralTilesTinyGlyphsAndWideBanners() throws {
+        let image = try tileImage(tiles: [CGRect(x: 20, y: 20, width: 12, height: 12),
+                                          CGRect(x: 80, y: 80, width: 250, height: 40)])
+        XCTAssertTrue(Observer.activationTiles(in: image, bounds: bounds).isEmpty)
+        let neutral = try tileImage(tiles: [CGRect(x: 320, y: 120, width: 96, height: 96)], color: (150, 150, 150))
+        XCTAssertTrue(Observer.activationTiles(in: neutral, bounds: bounds).isEmpty)
+    }
+
+    func testUnalignedOrDistantTileDoesNotInventAnActivationOffset() throws {
+        let label = observation("Tile action", box: CGRect(x: 320, y: 232, width: 96, height: 20))
+        for tiles in [[], [normalized(CGRect(x: 480, y: 120, width: 96, height: 96))],
+                      [normalized(CGRect(x: 320, y: 30, width: 96, height: 96))]] {
+            let candidates = Observer.candidates(from: [label], bounds: bounds, activationTiles: tiles)
+            let selected = try XCTUnwrap(candidates.first)
+            XCTAssertNil(selected.activationBox)
+            let point = try XCTUnwrap(Observer.screenPoint(for: selected, in: snapshot(candidates)))
+            XCTAssertEqual(point.y, bounds.minY + 242, accuracy: 0.01)
+        }
+    }
+
+    func testMultiplePlausibleTilesOrLabelsDoNotProduceAnAssociation() throws {
+        let label = observation("Tile action", box: CGRect(x: 320, y: 232, width: 96, height: 20))
+        let tile = normalized(CGRect(x: 320, y: 120, width: 96, height: 96))
+        let second = normalized(CGRect(x: 330, y: 130, width: 80, height: 80))
+        let ambiguousTiles = Observer.candidates(from: [label], bounds: bounds, activationTiles: [tile, second])
+        XCTAssertNil(try XCTUnwrap(ambiguousTiles.first).activationBox)
+        let overlappingLabel = observation("Other action", box: CGRect(x: 325, y: 225, width: 90, height: 20))
+        let ambiguousLabels = Observer.candidates(from: [label, overlappingLabel], bounds: bounds, activationTiles: [tile])
+        XCTAssertEqual(ambiguousLabels.count, 2)
+        XCTAssertTrue(ambiguousLabels.allSatisfy { $0.activationBox == nil })
+    }
+
+    func testTileMustStillExistAtTheSameGeometryWhenRevalidated() throws {
+        let label = normalized(CGRect(x: 320, y: 232, width: 96, height: 20))
+        let tile = normalized(CGRect(x: 320, y: 120, width: 96, height: 96))
+        let selected = Observer.Candidate(id: "visual_1", text: "Tile action", normalizedBox: label, activationBox: tile)
+        let jittered = Observer.Candidate(id: "visual_4", text: "Tile action", normalizedBox: label,
+                                          activationBox: tile.offsetBy(dx: 2 / bounds.width, dy: 1 / bounds.height))
+        XCTAssertEqual(Observer.revalidatedCandidate(selected, from: snapshot([selected]), in: snapshot([jittered])), jittered)
+        let moved = Observer.Candidate(id: "visual_4", text: "Tile action", normalizedBox: label,
+                                       activationBox: tile.offsetBy(dx: 9 / bounds.width, dy: 0))
+        XCTAssertNil(Observer.revalidatedCandidate(selected, from: snapshot([selected]), in: snapshot([moved])))
+        let vanished = Observer.Candidate(id: "visual_4", text: "Tile action", normalizedBox: label)
+        XCTAssertNil(Observer.revalidatedCandidate(selected, from: snapshot([selected]), in: snapshot([vanished])))
+        XCTAssertNil(Observer.revalidatedCandidate(vanished, from: snapshot([vanished]), in: snapshot([selected])))
+    }
+
+    func testOutOfWindowActivationGeometryCannotProduceAClick() {
+        let invalid = Observer.Candidate(id: "visual_1", text: "Tile action", normalizedBox: candidate().normalizedBox,
+                                        activationBox: CGRect(x: 0.95, y: 0.1, width: 0.2, height: 0.2))
+        XCTAssertNil(Observer.screenPoint(for: invalid, in: snapshot([invalid])))
+    }
+
+    private func normalized(_ box: CGRect) -> CGRect {
+        CGRect(x: box.minX / bounds.width, y: box.minY / bounds.height,
+               width: box.width / bounds.width, height: box.height / bounds.height)
+    }
+
+    private func observation(_ text: String, box: CGRect) -> Observer.TextObservation {
+        let box = normalized(box)
+        return .init(text: text, confidence: 1,
+                     visionBox: CGRect(x: box.minX, y: 1 - box.maxY, width: box.width, height: box.height))
+    }
+
+    /// Raw image rows use top-left coordinates, independently of CGContext's
+    /// drawing coordinates. The white glyph hole exercises connected background
+    /// detection without treating white content as part of the tile.
+    private func tileImage(tiles: [CGRect], scale: Int = 1, color: (UInt8, UInt8, UInt8) = (10, 110, 250)) throws -> CGImage {
+        let width = Int(bounds.width) * scale, height = Int(bounds.height) * scale
+        var pixels = [UInt8](repeating: 255, count: width * height * 4)
+        for tile in tiles {
+            let x1 = Int(tile.minX) * scale, x2 = Int(tile.maxX) * scale
+            let y1 = Int(tile.minY) * scale, y2 = Int(tile.maxY) * scale
+            for y in y1..<y2 {
+                for x in x1..<x2 {
+                    // Keep a white central glyph fully inside the colored tile.
+                    if abs(x - (x1 + x2) / 2) < (x2 - x1) / 6,
+                       abs(y - (y1 + y2) / 2) < (y2 - y1) / 6 { continue }
+                    let offset = (y * width + x) * 4
+                    pixels[offset] = color.0; pixels[offset + 1] = color.1; pixels[offset + 2] = color.2
+                }
+            }
+        }
+        let provider = try XCTUnwrap(CGDataProvider(data: Data(pixels) as CFData))
+        return try XCTUnwrap(CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
+                                    bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                    bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
+                                    provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent))
     }
 
     private func candidate(id: String = "visual_1", text: String = "快速会议", dx: CGFloat = 0) -> Observer.Candidate {

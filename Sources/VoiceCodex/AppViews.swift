@@ -230,7 +230,7 @@ final class MainView: NSView {
         sendButton.controlSize = .large
         sendButton.contentTintColor = Theme.green
         let inputRow = hstack([commandField, sendButton])
-        let footer = hstack([footerLabel, spacer(), textLabel("DEMO  ·  0.4", size: 9, weight: .medium, color: Theme.muted)])
+        let footer = hstack([footerLabel, spacer(), textLabel("DEMO  ·  0.4.2", size: 9, weight: .medium, color: Theme.muted)])
 
         let layout = vstack([top, hero, voiceCard, macRow, projectRow, resultCard, examplesButton, inputRow, footer], spacing: 16)
         layout.setCustomSpacing(28, after: top)
@@ -253,7 +253,7 @@ final class MainView: NSView {
     func configureMode(mac: Bool) {
         modeSelector.selectedSegment = mac ? 0 : 1
         heroTitle.stringValue = mac ? "边说，边让 Mac 动起来。" : "说一句，交给 Codex。"
-        heroSubtitle.stringValue = mac ? "一句多个动作，依次直接执行。停顿就开始，Esc 随时停止。" : "松手后，在 Terminal 里执行并显示过程。"
+        heroSubtitle.stringValue = mac ? "连续动作直接执行，点击后检查界面变化。Esc 随时停止。" : "松手后，在 Terminal 里执行并显示过程。"
         projectRow.isHidden = mac
         macRow.isHidden = !mac
         examplesButton.isHidden = !mac

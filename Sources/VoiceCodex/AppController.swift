@@ -384,7 +384,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             do {
                 try await self.macSequence.run(plan: { text, target in
-                    try await client.plan(transcript: text, applications: self.macDriver.applications(), currentApplicationID: target)
+                    let context = await self.macDriver.planningContext(applicationID: target)
+                    try Task.checkCancellation()
+                    return try await client.plan(transcript: text, applications: self.macDriver.applications(),
+                                                 currentApplicationID: target, observedControls: context)
                 }, perform: { command, step in
                     let applications = self.macDriver.applications()
                     let appName = applications.first { $0.id == command.applicationID }?.name ?? "当前应用"
@@ -395,11 +398,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     if self.macDriver.needsAccessibility(for: command.intent), !self.macDriver.accessibilityGranted {
                         throw DemoError.message("需要辅助功能权限来执行这个动作。点击「启用辅助功能」，在系统设置中允许 VoiceCodex 后重试。")
                     }
-                    if [.clickElement, .paste, .pressReturn, .closeAllWindows].contains(command.intent) {
-                        try await self.macDriver.waitForInterface(command: command)
-                    }
                     try Task.checkCancellation()
-                    return try await self.macDriver.execute(command: command, goal: step.text, jev: client)
+                    return try await self.macDriver.execute(command: command, goal: step.text, jev: client,
+                        onProgress: { progress in
+                            self.macStatus = "步骤 \(step.index)/\(step.total) · \(progress)"
+                            self.updateState()
+                        })
                 }, onStep: { step in
                     self.macStatus = "步骤 \(step.index)/\(step.total) · Jev 正在理解…"
                     self.updateState()

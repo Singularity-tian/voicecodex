@@ -155,6 +155,10 @@ final class MacControlDriver {
             let ax = applicationElement(app)
             if elementAttribute(ax, kAXFocusedWindowAttribute) != nil {
                 sawWindow = true
+                // A click will select and revalidate one concrete control in
+                // this window. Its own overlay checks use positive evidence;
+                // slow AX children alone must not be called a dialog.
+                if command.intent == .clickElement { return }
                 // During launch, AX may expose a window before its child
                 // attributes respond. Give the dialog check time to settle;
                 // a transient timeout must not immediately look like a modal.
@@ -166,7 +170,8 @@ final class MacControlDriver {
         throw MacControlError.noWindow
     }
 
-    func execute(command: MacCommand, goal: String = "", jev: JevClient) async throws -> String {
+    func execute(command: MacCommand, goal: String = "", jev: JevClient,
+                 onProgress: (String) -> Void = { _ in }) async throws -> String {
         try Task.checkCancellation()
         guard command.intent != .unsupported else { throw MacControlError.unsupported }
         guard let id = command.applicationID ?? foregroundApplicationID else { throw MacControlError.noTarget }
@@ -194,6 +199,10 @@ final class MacControlDriver {
         }
         guard let app = application else { throw MacControlError.applicationNotRunning }
         try await focus(app)
+        if [.clickElement, .paste, .pressReturn, .closeAllWindows].contains(command.intent) {
+            try await waitForInterface(command: command)
+            try verifyFocus(app)
+        }
         let ax = applicationElement(app)
         let name = app.localizedName ?? id
         switch command.intent {
@@ -282,7 +291,7 @@ final class MacControlDriver {
             }
             return "已向 \(name) 当前窗口发送滚动；滚动位置尚未验证。"
         case .clickElement:
-            return try await click(goal: goal.isEmpty ? (command.text ?? "") : goal, app: app, jev: jev)
+            return try await click(goal: goal.isEmpty ? (command.text ?? "") : goal, app: app, jev: jev, onProgress: onProgress)
         case .openApp, .unsupported: throw MacControlError.unsupported
         }
     }
@@ -599,9 +608,244 @@ final class MacControlDriver {
         let label: String
     }
 
-    private func click(goal: String, app: NSRunningApplication, jev: JevClient) async throws -> String {
+    /// Only describes the current external target. A typed command may have
+    /// brought VoiceCodex forward; inspecting its remembered target is read-only.
+    /// Never activate another app or read text-field contents to help planning.
+    func planningContext(applicationID: String?) async -> [String: String] {
+        guard accessibilityGranted, let id = applicationID ?? foregroundApplicationID,
+              let app = NSRunningApplication.runningApplications(withBundleIdentifier: id).first(where: { !$0.isTerminated }) else { return [:] }
+        let callerPID = workspace.frontmostApplication?.processIdentifier
+        func validTarget() -> Bool {
+            guard !Task.isCancelled, !app.isTerminated,
+                  workspace.frontmostApplication?.processIdentifier == callerPID else { return false }
+            return callerPID == app.processIdentifier ||
+                (callerPID == ProcessInfo.processInfo.processIdentifier && foregroundApplicationID == id)
+        }
+        guard validTarget() else { return [:] }
+        let ax = applicationElement(app)
+        let window = await Self.waitForPlanningWindow(validTarget: validTarget, read: {
+            self.elementAttribute(ax, kAXFocusedWindowAttribute) ?? self.elementAttribute(ax, kAXMainWindowAttribute)
+                ?? (try? self.windowSnapshot(ax)).flatMap { $0.count == 1 ? $0.first : nil }
+        })
+        guard let window else { return [:] }
+        var labels: [String: String] = [:]
+        let deadline = Date().addingTimeInterval(3)
+        for element in boundedDescendants(window) {
+            guard validTarget() else { return [:] }
+            guard Date() < deadline else { break }
+            guard (try? rejectProtectedField(element)) != nil,
+                  boolAttribute(element, "AXHidden") != true,
+                  boolAttribute(element, kAXEnabledAttribute) != false,
+                  actions(element).contains(kAXPressAction),
+                  !["AXCloseButton", "AXMinimizeButton", "AXZoomButton", "AXFullScreenButton"]
+                    .contains(stringAttribute(element, kAXSubroleAttribute) ?? "") else { continue }
+            let label = controlLabel(element)
+            if !label.isEmpty { labels["ctx_ax_\(labels.count + 1)"] = label }
+            if labels.count == 40 { break }
+        }
+        if labels.count < 3, CGPreflightScreenCaptureAccess(), let bounds = frame(of: window),
+           (try? rejectProtectedField(elementAttribute(ax, kAXFocusedUIElementAttribute))) != nil,
+           let snapshot = try? await VisualControlObserver().observe(processID: app.processIdentifier, expectedWindowFrame: bounds) {
+            guard validTarget() else { return [:] }
+            // AX and OCR can describe the same button. Keep a single source,
+            // rather than invent two ambiguous controls with identical labels.
+            // No within-source duplicates are collapsed by this handoff.
+            let visualLabels = Dictionary(uniqueKeysWithValues: snapshot.candidates.prefix(40).map {
+                ("ctx_\($0.id)", "屏幕文字 · " + $0.text)
+            })
+            if !visualLabels.isEmpty {
+                labels = visualLabels
+            }
+        }
+        return validTarget() ? labels : [:]
+    }
+
+    /// Process launch can precede its first readable window. Poll only reads,
+    /// without activating anything; cancellation or any target change ends it.
+    static func waitForPlanningWindow<Window>(
+        validTarget: () -> Bool, read: () -> Window?,
+        now: () -> Date = Date.init,
+        wait: () async throws -> Void = { try await Task.sleep(nanoseconds: 150_000_000) }
+    ) async -> Window? {
+        let deadline = now().addingTimeInterval(3)
+        // Reserve 450 ms for the three bounded AX reads in the final attempt.
+        for _ in 0..<20 {
+            guard !Task.isCancelled, validTarget(), now().addingTimeInterval(0.45) <= deadline else { return nil }
+            let window = read()
+            guard !Task.isCancelled, validTarget() else { return nil }
+            if let window { return window }
+            guard now().addingTimeInterval(0.6) <= deadline else { return nil }
+            do { try await wait() } catch { return nil }
+        }
+        return nil
+    }
+
+    struct ClickState {
+        let windows: [AXUIElement]?
+        /// Local, bounded widget labels/status values; never uploaded to Jev.
+        let semantics: [String]?
+        let visualLabels: Set<String>?
+        let contentWindow: AXUIElement?
+
+        init(windows: [AXUIElement]? = nil, semantics: [String]? = nil,
+             visualLabels: Set<String>? = nil, contentWindow: AXUIElement? = nil) {
+            self.windows = windows
+            self.semantics = semantics
+            self.visualLabels = visualLabels
+            self.contentWindow = contentWindow
+        }
+    }
+
+    /// This helper owns exactly one dispatch. Subsequent attempts only read;
+    /// unreadable/no-op results cannot advance the command sequence.
+    static func performVerifiedClick<State, Evidence: Equatable>(
+        baseline: State?, attempts: Int = 8,
+        action: () async throws -> Void,
+        observe: () async throws -> State?,
+        evidence: (State, State) -> Evidence?,
+        wait: () async throws -> Void = { try await Task.sleep(nanoseconds: 250_000_000) }
+    ) async throws {
+        try Task.checkCancellation()
+        guard let baseline else {
+            throw MacControlError.incomplete("无法读取点击前的界面，未执行点击；后续步骤已停止。")
+        }
+        try await action()
+        var previousEvidence: Evidence?
+        var lastWasReadable = false
+        for _ in 0..<max(0, attempts) {
+            try Task.checkCancellation()
+            try await wait()
+            try Task.checkCancellation()
+            let current = try await observe()
+            try Task.checkCancellation()
+            lastWasReadable = current != nil
+            guard let current, let changed = evidence(baseline, current) else {
+                previousEvidence = nil
+                continue
+            }
+            // A single transient frame, hover hint, or partially loaded tree
+            // is not enough to claim that the click produced a UI transition.
+            if previousEvidence == changed { return }
+            previousEvidence = changed
+        }
+        let reason = lastWasReadable ? "没有观察到界面内容变化，可能没有点中" : "点击后的界面无法可靠读取，结果未知"
+        throw MacControlError.incomplete("已发送一次点击，但\(reason)；未重复点击，后续步骤已停止。")
+    }
+
+    static func clickChange(_ before: ClickState, _ after: ClickState) -> String? {
+        if let previous = before.windows, let current = after.windows,
+           current.count != previous.count || current.contains(where: { candidate in !previous.contains { CFEqual(candidate, $0) } }) {
+            return "windows:" + current.map { String(CFHash($0)) }.sorted().joined(separator: ",")
+        }
+        // A switch between two existing windows does not prove a click worked.
+        switch (before.contentWindow, after.contentWindow) {
+        case let (.some(a), .some(b)): guard CFEqual(a, b) else { return nil }
+        case (.none, .none): break
+        default: return nil
+        }
+        if let previous = before.semantics, let current = after.semantics,
+           !previous.isEmpty, !current.isEmpty, current != previous {
+            let added = Set(current).subtracting(previous), removed = Set(previous).subtracting(current)
+            if (!added.isEmpty && !removed.isEmpty) || added.count >= 2 {
+                return "ax:" + current.joined(separator: "\n")
+            }
+        }
+        if let previous = before.visualLabels, let current = after.visualLabels {
+            // Geometry, cursor movement, and one added tooltip do not count.
+            // Require a persistent content replacement with multiple new labels.
+            let added = current.subtracting(previous), removed = previous.subtracting(current)
+            if added.count >= 2, !removed.isEmpty {
+                return "ocr:" + current.sorted().joined(separator: "\n")
+            }
+        }
+        return nil
+    }
+
+    private func clickState(app: NSRunningApplication, includeVisual: Bool,
+                            visual: VisualControlObserver.Snapshot? = nil) async -> ClickState? {
+        guard !Task.isCancelled, !app.isTerminated,
+              workspace.frontmostApplication?.processIdentifier == app.processIdentifier else { return nil }
+        let ax = applicationElement(app)
+        let windows = try? windowSnapshot(ax).filter {
+            try observationAttribute($0, kAXSubroleAttribute) as? String != "AXHelpTag"
+        }
+        let window = elementAttribute(ax, kAXFocusedWindowAttribute)
+        let semantics = window.flatMap { try? semanticClickState(in: $0) }
+        var labels = visual.map { Set($0.candidates.compactMap { Self.stableClickText(VisualControlObserver.labelIdentity($0.text)) }) }
+        if includeVisual, labels == nil, let window, let bounds = frame(of: window),
+           (try? rejectProtectedField(elementAttribute(ax, kAXFocusedUIElementAttribute))) != nil,
+           let snapshot = try? await VisualControlObserver().observe(processID: app.processIdentifier, expectedWindowFrame: bounds) {
+            labels = Set(snapshot.candidates.compactMap { Self.stableClickText(VisualControlObserver.labelIdentity($0.text)) })
+        }
+        guard !Task.isCancelled, workspace.frontmostApplication?.processIdentifier == app.processIdentifier,
+              windows != nil || semantics != nil || labels != nil else { return nil }
+        return ClickState(windows: windows, semantics: semantics, visualLabels: labels, contentWindow: window)
+    }
+
+    /// A strict observation reader: a timeout is unknown, not an empty tree.
+    /// Excludes focus/geometry and editable or protected values. Only widget
+    /// captions, static status text and numeric/bool toggle values are compared.
+    private func semanticClickState(in window: AXUIElement) throws -> [String]? {
+        let deadline = Date().addingTimeInterval(1.5)
+        var queue = [window], index = 0, rows: [String] = []
+        let roles = [kAXButtonRole, kAXStaticTextRole, kAXCheckBoxRole, kAXRadioButtonRole,
+                     kAXPopUpButtonRole, kAXMenuItemRole, kAXDisclosureTriangleRole]
+        while index < queue.count {
+            guard index < 140, Date() < deadline, !Task.isCancelled else { return nil }
+            let element = queue[index]; index += 1
+            let role = try observationAttribute(element, kAXRoleAttribute) as? String
+            let subrole = try observationAttribute(element, kAXSubroleAttribute) as? String
+            guard role != "AXSecureTextField", subrole != kAXSecureTextFieldSubrole,
+                  subrole != "AXHelpTag", role != "AXHelpTag",
+                  try observationAttribute(element, "AXProtectedContent") as? Bool != true,
+                  try observationAttribute(element, "AXHidden") as? Bool != true else { continue }
+            if roles.contains(role ?? ""), !["AXCloseButton", "AXMinimizeButton", "AXZoomButton", "AXFullScreenButton"].contains(subrole ?? "") {
+                var parts = [role ?? ""]
+                for key in [kAXTitleAttribute, kAXDescriptionAttribute] {
+                    if let text = try observationAttribute(element, key) as? String, let stable = Self.stableClickText(text) { parts.append(stable) }
+                }
+                if let value = try observationAttribute(element, kAXValueAttribute) {
+                    if role == kAXStaticTextRole, let text = value as? String, let stable = Self.stableClickText(text) { parts.append(stable) }
+                    else if [kAXCheckBoxRole, kAXRadioButtonRole, kAXDisclosureTriangleRole].contains(role ?? ""), let number = value as? NSNumber {
+                        parts.append(number.stringValue)
+                    }
+                }
+                if parts.count > 1 { rows.append(parts.joined(separator: " · ")) }
+            }
+            if let children = try observationAttribute(element, kAXChildrenAttribute) as? [CFTypeRef] {
+                guard queue.count + children.count <= 180 else { return nil }
+                queue.append(contentsOf: children.filter { CFGetTypeID($0) == AXUIElementGetTypeID() }.map { unsafeBitCast($0, to: AXUIElement.self) })
+            }
+        }
+        return rows.sorted()
+    }
+
+    nonisolated static func stableClickText(_ text: String) -> String? {
+        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+        // A wall clock or meeting-duration ticker can advance during a missed
+        // click. It is unrelated to the requested action, even if AX exposes it.
+        let clock = #"^\d{1,2}:\d{2}(?::\d{2})?(?:\s*[APap][Mm])?$"#
+        guard value.range(of: clock, options: .regularExpression) == nil else { return nil }
+        return String(value.prefix(160))
+    }
+
+    private func observationAttribute(_ element: AXUIElement, _ key: String) throws -> CFTypeRef? {
+        AXUIElementSetMessagingTimeout(element, axTimeout)
+        var value: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(element, key as CFString, &value)
+        switch error {
+        case .success: return value
+        case .attributeUnsupported, .noValue: return nil
+        default: throw MacControlError.actionFailed
+        }
+    }
+
+    private func click(goal: String, app: NSRunningApplication, jev: JevClient,
+                       onProgress: (String) -> Void) async throws -> String {
         let ax = applicationElement(app)
         guard let window = elementAttribute(ax, kAXFocusedWindowAttribute) else { throw MacControlError.noWindow }
+        guard !hasChildSheet(in: window) else { throw MacControlError.blockedByDialog }
         var controls: [String: ObservedControl] = [:]
         let deadline = Date().addingTimeInterval(4)
         for element in boundedDescendants(window) {
@@ -617,7 +861,7 @@ final class MacControlDriver {
             if controls.count == 60 { break }
         }
         guard !controls.isEmpty else {
-            return try await clickVisual(goal: goal, app: app, window: window, jev: jev)
+            return try await clickVisual(goal: goal, app: app, window: window, jev: jev, onProgress: onProgress)
         }
         let selected: String
         do {
@@ -627,7 +871,7 @@ final class MacControlDriver {
             // drawing the requested control themselves. An explicit no-match
             // may use a fresh visual observation; uncertain/failed choices may not.
             try Task.checkCancellation()
-            return try await clickVisual(goal: goal, app: app, window: window, jev: jev)
+            return try await clickVisual(goal: goal, app: app, window: window, jev: jev, onProgress: onProgress)
         }
         try Task.checkCancellation()
         guard let control = controls[selected] else { throw MacControlError.staleElement }
@@ -639,22 +883,32 @@ final class MacControlDriver {
               actions(control.element).contains(kAXPressAction) else { throw MacControlError.staleElement }
         var pid: pid_t = 0
         guard AXUIElementGetPid(control.element, &pid) == .success, pid == app.processIdentifier else { throw MacControlError.staleElement }
-        try await Self.withNativeActionCheckpoint {
-            guard let current = elementAttribute(ax, kAXFocusedWindowAttribute), CFEqual(current, window),
-                  controlLabel(control.element) == control.label,
-                  boolAttribute(control.element, "AXHidden") != true,
-                  boolAttribute(control.element, kAXEnabledAttribute) != false,
-                  actions(control.element).contains(kAXPressAction) else { throw MacControlError.staleElement }
-            try verifyFocus(app)
-            guard AXUIElementPerformAction(control.element, kAXPressAction as CFString) == .success else { throw MacControlError.actionFailed }
-        }
-        return "已向 \(app.localizedName ?? "目标 App") 的控件发送点击；点击后的任务结果尚未验证。"
+        let verifyVisual = CGPreflightScreenCaptureAccess()
+        let before = await clickState(app: app, includeVisual: verifyVisual)
+        try await Self.performVerifiedClick(baseline: before, action: {
+            try await Self.withNativeActionCheckpoint {
+                guard let current = elementAttribute(ax, kAXFocusedWindowAttribute), CFEqual(current, window),
+                      controlLabel(control.element) == control.label,
+                      boolAttribute(control.element, "AXHidden") != true,
+                      boolAttribute(control.element, kAXEnabledAttribute) != false,
+                      actions(control.element).contains(kAXPressAction) else { throw MacControlError.staleElement }
+                guard !hasChildSheet(in: current) else { throw MacControlError.blockedByDialog }
+                try verifyFocus(app)
+                guard AXUIElementPerformAction(control.element, kAXPressAction as CFString) == .success else { throw MacControlError.actionFailed }
+            }
+            onProgress("正在检查点击结果…")
+        }, observe: {
+            try self.verifyFocus(app)
+            return await self.clickState(app: app, includeVisual: verifyVisual)
+        }, evidence: Self.clickChange)
+        return "已点击 \(app.localizedName ?? "目标 App") 的「\(control.label)」，并观察到界面内容变化；业务结果尚未确认。"
     }
 
-    private func clickVisual(goal: String, app: NSRunningApplication, window: AXUIElement, jev: JevClient) async throws -> String {
+    private func clickVisual(goal: String, app: NSRunningApplication, window: AXUIElement, jev: JevClient,
+                             onProgress: (String) -> Void) async throws -> String {
         try verifyFocus(app)
         let ax = applicationElement(app)
-        guard !hasBlockingDialog(ax) else { throw MacControlError.blockedByDialog }
+        guard !hasChildSheet(in: window) else { throw MacControlError.blockedByDialog }
         guard let focusedWindow = elementAttribute(ax, kAXFocusedWindowAttribute), CFEqual(focusedWindow, window) else {
             throw MacControlError.visualTargetChanged("目标窗口已切换")
         }
@@ -665,7 +919,7 @@ final class MacControlDriver {
             observe: { try await observer.observe(processID: app.processIdentifier, expectedWindowFrame: bounds) },
             validate: {
                 try self.verifyFocus(app)
-                guard !self.hasBlockingDialog(ax) else { throw MacControlError.blockedByDialog }
+                guard !self.hasChildSheet(in: window) else { throw MacControlError.blockedByDialog }
                 guard let current = self.elementAttribute(ax, kAXFocusedWindowAttribute), CFEqual(current, window),
                       self.frame(of: current) == bounds else { throw MacControlError.visualTargetChanged("窗口或位置已变化") }
             }, choose: { observation in
@@ -688,32 +942,37 @@ final class MacControlDriver {
               let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left) else {
             throw MacControlError.actionFailed
         }
-        try await Self.withNativeActionCheckpoint {
-            try verifyFocus(app)
-            guard !hasBlockingDialog(ax) else { throw MacControlError.blockedByDialog }
-            guard let finalWindow = elementAttribute(ax, kAXFocusedWindowAttribute), CFEqual(finalWindow, window),
-                  frame(of: finalWindow) == bounds else { throw MacControlError.visualTargetChanged("点击前窗口已变化") }
-            // Validate the point against its actual process and window.
-            var hit: AXUIElement?
-            guard AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(point.x), Float(point.y), &hit) == .success,
-                  let hit else { throw MacControlError.visualTargetChanged("无法读取点击位置的控件") }
-            var hitPID: pid_t = 0
-            guard AXUIElementGetPid(hit, &hitPID) == .success, hitPID == app.processIdentifier else { throw MacControlError.focusChanged }
-            if let hitWindow = containingWindow(of: hit) {
-                guard CFEqual(hitWindow, window) else { throw MacControlError.visualTargetChanged("点击位置属于另一个窗口") }
-            } else {
-                // Custom-drawn Qt controls may resolve only to AXApplication.
-                // Use the window server's front-to-back list to prove that the
-                // very same captured window owns the click, rather than treating
-                // absent AXWindow metadata as a changed interface.
+        let before = await clickState(app: app, includeVisual: true, visual: fresh)
+        try await Self.performVerifiedClick(baseline: before, action: {
+            try await Self.withNativeActionCheckpoint {
+                try verifyFocus(app)
+                guard !hasChildSheet(in: window) else { throw MacControlError.blockedByDialog }
+                guard let finalWindow = elementAttribute(ax, kAXFocusedWindowAttribute), CFEqual(finalWindow, window),
+                      frame(of: finalWindow) == bounds else { throw MacControlError.visualTargetChanged("点击前窗口已变化") }
+                // Validate the point against its actual process and window.
+                var hit: AXUIElement?
+                guard AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(point.x), Float(point.y), &hit) == .success,
+                      let hit else { throw MacControlError.visualTargetChanged("无法读取点击位置的控件") }
+                var hitPID: pid_t = 0
+                guard AXUIElementGetPid(hit, &hitPID) == .success, hitPID == app.processIdentifier else { throw MacControlError.focusChanged }
+                // A sheet may resolve to its parent AXWindow while having a
+                // separate WindowServer surface. Prove capture ownership even
+                // when the AX hit supplies a seemingly matching parent window.
                 guard Self.frontmostWindow(at: point, in: onScreenHitWindows()).map({
                     $0.processID == app.processIdentifier && $0.windowID == fresh.windowID
-                }) == true else { throw MacControlError.visualTargetChanged("无法确认点击位置所属窗口") }
+                }) == true else { throw MacControlError.visualTargetChanged("点击位置被其他窗口或面板遮挡") }
+                if let hitWindow = containingWindow(of: hit) {
+                    guard CFEqual(hitWindow, window) else { throw MacControlError.visualTargetChanged("点击位置属于另一个窗口") }
+                }
+                down.post(tap: .cghidEventTap)
+                up.post(tap: .cghidEventTap)
             }
-            down.post(tap: .cghidEventTap)
-            up.post(tap: .cghidEventTap)
-        }
-        return "已点击 \(app.localizedName ?? "目标 App") 的屏幕文字「\(candidate.text)」；后续任务结果尚未验证。"
+            onProgress("正在检查点击结果…")
+        }, observe: {
+            try self.verifyFocus(app)
+            return await self.clickState(app: app, includeVisual: true)
+        }, evidence: Self.clickChange)
+        return "已点击 \(app.localizedName ?? "目标 App") 的「\(candidate.text)」，并观察到界面内容变化；业务结果尚未确认。"
     }
 
     /// A just-opened app can replace its loading view while Jev is choosing.
@@ -830,6 +1089,22 @@ final class MacControlDriver {
             return (try? windowSnapshot(app).isEmpty) != true
         }
         return hasBlockingDialog(in: focused)
+    }
+
+    /// Clicking an explicitly observed modal window is valid. A sheet covering
+    /// its parent is different: the captured parent does not include that sheet.
+    /// Only positive metadata counts here; slow AX reads are not dialog proof.
+    /// Native clicks additionally prove frontmost WindowServer point ownership.
+    private func hasChildSheet(in window: AXUIElement) -> Bool {
+        let deadline = Date().addingTimeInterval(1)
+        for child in elementsAttribute(window, kAXChildrenAttribute).prefix(30) {
+            guard Date() < deadline, !Task.isCancelled else { return false }
+            if boolAttribute(child, "AXHidden") == true { continue }
+            if stringAttribute(child, kAXRoleAttribute) == kAXSheetRole || boolAttribute(child, kAXModalAttribute) == true {
+                return true
+            }
+        }
+        return false
     }
 
     private func hasBlockingDialog(in focused: AXUIElement) -> Bool {

@@ -2,6 +2,32 @@
 // Build with script/build_qa_target.sh, then launch the generated .app.
 import AppKit
 
+/// Deliberately models custom-drawn launchers: the icon is clickable, its
+/// caption is not, and no AXPress control is exposed. OCR must locate the
+/// caption and associate the actual tile rather than claim the text was clicked.
+final class QATile: NSView {
+    var onActivate: (() -> Void)?
+    private var tile: NSRect { NSRect(x: (bounds.width - 92) / 2, y: 38, width: 92, height: 92) }
+    override var intrinsicContentSize: NSSize { NSSize(width: 150, height: 140) }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.systemBlue.setFill()
+        NSBezierPath(roundedRect: tile, xRadius: 18, yRadius: 18).fill()
+        let mark: NSString = "+"
+        mark.draw(at: NSPoint(x: tile.midX - 17, y: tile.midY - 25), withAttributes: [
+            .font: NSFont.systemFont(ofSize: 48, weight: .bold), .foregroundColor: NSColor.white
+        ])
+        let label: NSString = "Tile action"
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 19), .foregroundColor: NSColor.labelColor
+        ]
+        label.draw(at: NSPoint(x: (bounds.width - label.size(withAttributes: attributes).width) / 2, y: 8),
+                   withAttributes: attributes)
+    }
+    override func mouseDown(with event: NSEvent) {
+        if tile.contains(convert(event.locationInWindow, from: nil)) { onActivate?() }
+    }
+}
+
 @MainActor
 final class QATarget: NSObject, NSApplicationDelegate {
     private var windows: [NSWindow] = []
@@ -37,7 +63,7 @@ final class QATarget: NSObject, NSApplicationDelegate {
     @objc func newWindow() {
         let number = nextWindow
         nextWindow += 1
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 660, height: 520),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 720, height: 720),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "VoiceCodex QA — Window \(number)"
         window.isReleasedWhenClosed = false
@@ -51,6 +77,17 @@ final class QATarget: NSObject, NSApplicationDelegate {
         let row = NSStackView(views: [count, increment, reset])
         row.orientation = .horizontal
         row.spacing = 16
+        let noEffect = NSButton(title: "No effect", target: self, action: #selector(noEffect(_:)))
+        let delayed = NSButton(title: "Delayed increment", target: self, action: #selector(delayedIncrement(_:)))
+        let checks = NSStackView(views: [noEffect, delayed])
+        checks.spacing = 16
+        let tile = QATile()
+        tile.setAccessibilityElement(false)
+        tile.onActivate = { [weak self, weak window] in
+            guard let self, let window else { return }
+            self.counters[ObjectIdentifier(window), default: 0] += 1
+            self.updateCounter(in: window)
+        }
         let field = NSTextField(string: "")
         field.placeholderString = "Single-line input for literal typing"
         field.setAccessibilityLabel("QA single line input")
@@ -72,7 +109,7 @@ final class QATarget: NSObject, NSApplicationDelegate {
         scroll.documentView = editor
         let help = NSTextField(labelWithString: "Only disposable QA content. Closing these windows cannot delete user documents.")
         help.textColor = .secondaryLabelColor
-        let stack = NSStackView(views: [title, row, field, scroll, help])
+        let stack = NSStackView(views: [title, row, checks, tile, field, scroll, help])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 16
@@ -84,6 +121,8 @@ final class QATarget: NSObject, NSApplicationDelegate {
             stack.topAnchor.constraint(equalTo: window.contentView!.topAnchor, constant: 24),
             stack.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor, constant: -20),
             field.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            tile.widthAnchor.constraint(equalToConstant: 150),
+            tile.heightAnchor.constraint(equalToConstant: 140),
             scroll.widthAnchor.constraint(equalTo: stack.widthAnchor),
             scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 230)
         ])
@@ -107,6 +146,15 @@ final class QATarget: NSObject, NSApplicationDelegate {
         guard let window = sender.window else { return }
         counters[ObjectIdentifier(window)] = 0
         updateCounter(in: window)
+    }
+
+    @objc private func noEffect(_ sender: NSButton) {}
+
+    @objc private func delayedIncrement(_ sender: NSButton) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self, weak sender] in
+            guard let sender else { return }
+            self?.incrementCounter(sender)
+        }
     }
 
     private func updateCounter(in window: NSWindow) {

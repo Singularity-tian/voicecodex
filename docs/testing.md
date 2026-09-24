@@ -134,3 +134,17 @@ Each step must return the exact expected intent, application, and literal text. 
 A cold-start Tencent open → Schedule click probe initially returned no match; a subsequent settled-window click succeeded. The driver now allows one fresh observation after an explicit no-match and only reselects when visible candidates genuinely change in the same window. Six regression cases cover changed versus unchanged evidence, alternate errors, cancellation, and the one-retry bound. No low-confidence or native action retries were added.
 
 The final signed build also waits for the existing dialog check to clear when an AX focused window first appears, rather than immediately treating launch-time AX delays as a dialog. A fresh cold-start sequence still ended with `目标 App 没有可操作的窗口。` before the home window became readable. Cold-start open → click remains a known limitation; the settled-window click results above do not establish that sequence as passing. The final local run passed all 186 tests and the signed application build.
+
+## Verified click and contextual command validation — 0.4.2
+
+The disposable QA target now includes a custom-drawn blue tile whose caption is not clickable, a `No effect` button, and a `Delayed increment` button with a 600 ms delay. These exercise actual native and OCR input without user documents, network effects, or meeting creation.
+
+- Reproduced the old behavior through the installed 0.4.1 UI: `在 VoiceCodex QA Target 点击「Tile action」` returned a click receipt while the counter stayed at 0. On the signed 0.4.2 app, the identical request hit the actual colored tile, changed the counter to 1 exactly, and returned an observed-content-change receipt.
+- On 0.4.2, `在 VoiceCodex QA Target 点击「No effect」，然后点击「Increment counter」` sent the first click once, reported no observed change, and stopped the remaining step. The counter stayed at 1. No confirmation was displayed.
+- The bare English command `Delayed increment` resolved from the current app's visible controls. The native button's delayed effect changed the counter from 1 to 2 exactly; the driver waited for and verified the content change.
+- An initial Tencent cold-start probe still hit a false dialog error before clicking. Explicit control clicks now distinguish positively observed child sheets from an AX timeout; visual clicks always check the frontmost WindowServer surface, including when AX resolves a sheet hit to its parent. Shortcut/window-closing guards remain unchanged. Earlier failures stay in local history.
+- The subsequent cold-start sequence correctly interpreted the bare second step, then refused the native click because a floating preview covered the target window. This is a verified obstruction check, not a passed click or meeting creation.
+- Local `swift test`: 223 tests passed. Signed build and installed signature verification passed; Accessibility and Screen Recording grants remained enabled.
+- The bounded synthetic grounded planner run passed 11/11 cases. It covers Chinese/English bare labels, immediate versus scheduled meeting goals, literal/app isolation, vague and absent controls, and explicit click requests with partial AX observations. Exact label cases resolve locally; semantic cases exercise the real TypeSafe API. The 0.75 model threshold is unchanged.
+
+Run the additional grounded cases with `.build/jev-sequence-live-check --live --filter grounded --output .build/qa/jev-grounded-results.json` after compiling the checker as above. This checker performs no desktop input.

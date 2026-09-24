@@ -9,7 +9,7 @@ import Foundation
 struct JevSequenceLiveCheck {
     private struct Expected {
         let intent: MacIntent
-        let app: String
+        let app: String?
         var text: String? = nil
     }
     private struct SequenceCase {
@@ -17,6 +17,7 @@ struct JevSequenceLiveCheck {
         let transcript: String
         let current: String
         let expected: [Expected]
+        var observedControls: [String: [String: String]] = [:]
     }
     private struct ControlCase {
         let id: String
@@ -49,6 +50,7 @@ struct JevSequenceLiveCheck {
     private static let meeting = "com.tencent.meeting"
     private static let chrome = "com.google.Chrome"
     private static let editor = "com.apple.TextEdit"
+    private static let meetingHome = ["quick": "屏幕文字 · 快速会议丷", "join": "屏幕文字 · 加入会议", "schedule": "屏幕文字 · 预定会议∨"]
     // Public fixed descriptors. Tencent Meeting's installed bundle ID was
     // verified from its Info.plist; no windows or desktop state are inspected.
     private static let apps = [
@@ -74,7 +76,29 @@ struct JevSequenceLiveCheck {
         .init(id: "literal-return-en", transcript: "Type \"then open Chrome\" then press Return", current: editor,
               expected: [.init(intent: .typeText, app: editor, text: "then open Chrome"), .init(intent: .pressReturn, app: editor)]),
         .init(id: "streamed-continuation-zh", transcript: "然后创建一个新的会议。", current: meeting,
-              expected: [.init(intent: .clickElement, app: meeting)])
+              expected: [.init(intent: .clickElement, app: meeting)]),
+        .init(id: "grounded-quick-bare-zh", transcript: "快速会议。", current: meeting,
+              expected: [.init(intent: .clickElement, app: meeting)], observedControls: [meeting: meetingHome]),
+        .init(id: "grounded-schedule-bare-zh", transcript: "预定会议。", current: meeting,
+              expected: [.init(intent: .clickElement, app: meeting)], observedControls: [meeting: meetingHome]),
+        .init(id: "grounded-quick-bare-en", transcript: "Quick Meeting.", current: meeting,
+              expected: [.init(intent: .clickElement, app: meeting)], observedControls: [meeting: ["quick": "AXButton · Quick Meeting", "join": "AXButton · Join Meeting"]]),
+        .init(id: "grounded-quick-zh-goal", transcript: "开个会", current: meeting,
+              expected: [.init(intent: .clickElement, app: meeting)], observedControls: [meeting: meetingHome]),
+        .init(id: "grounded-schedule-zh-goal", transcript: "约个会", current: meeting,
+              expected: [.init(intent: .clickElement, app: meeting)], observedControls: [meeting: meetingHome]),
+        .init(id: "grounded-start-en-goal", transcript: "Start a meeting now", current: meeting,
+              expected: [.init(intent: .clickElement, app: meeting)], observedControls: [meeting: meetingHome]),
+        .init(id: "grounded-literal-isolation", transcript: "输入「快速会议」", current: editor,
+              expected: [.init(intent: .typeText, app: editor, text: "快速会议")], observedControls: [editor: meetingHome]),
+        .init(id: "grounded-current-app-isolation", transcript: "在 Chrome 点击快速会议", current: meeting,
+              expected: [.init(intent: .clickElement, app: chrome)], observedControls: [meeting: meetingHome]),
+        .init(id: "grounded-ambiguous", transcript: "会议", current: meeting,
+              expected: [.init(intent: .unsupported, app: nil)], observedControls: [meeting: meetingHome]),
+        .init(id: "grounded-absent", transcript: "快速会议", current: meeting,
+              expected: [.init(intent: .unsupported, app: nil)], observedControls: [meeting: ["join": "AXButton · 加入会议", "schedule": "AXButton · 预定会议"]]),
+        .init(id: "grounded-explicit-click-partial-context", transcript: "在腾讯会议点击「快速会议」", current: meeting,
+              expected: [.init(intent: .clickElement, app: meeting)], observedControls: [meeting: ["one": "AXButton · Help", "two": "AXButton · More", "three": "AXButton · Close", "four": "AXButton · Menu"]])
     ]
     private static let controls: [ControlCase] = [
         .init(id: "control-new-zh", goal: "创建一个新的会议", controls: ["quick": "快速会议", "join": "加入会议", "schedule": "预定会议"], expected: "quick"),
@@ -128,7 +152,8 @@ struct JevSequenceLiveCheck {
                     passed = steps.count == scenario.expected.count
                     var target = scenario.current
                     for (index, step) in steps.enumerated() where passed {
-                        let command = try await client.plan(transcript: step, applications: apps, currentApplicationID: target)
+                        let command = try await client.plan(transcript: step, applications: apps, currentApplicationID: target,
+                                                            observedControls: scenario.observedControls[target] ?? [:])
                         observed.append(describe(command.intent, app: command.applicationID, text: command.text))
                         confidences.append(command.confidence)
                         let expected = scenario.expected[index]
@@ -139,7 +164,13 @@ struct JevSequenceLiveCheck {
                     }
                 } catch {
                     observed.append(safeError(error))
-                    passed = false
+                    if scenario.expected.count == 1, scenario.expected[0].intent == .unsupported,
+                       let error = error as? JevClientError {
+                        switch error {
+                        case .unsupportedCommand, .lowConfidence: passed = true
+                        default: passed = false
+                        }
+                    } else { passed = false }
                 }
                 let result = Result(id: scenario.id, kind: "sequence-planner", transcript: scenario.transcript,
                                     steps: steps, expected: scenario.expected.map { describe($0.intent, app: $0.app, text: $0.text) },
@@ -197,7 +228,7 @@ struct JevSequenceLiveCheck {
     }
     private static func save(_ results: [Result], model: String, to output: URL) throws {
         let report = Report(generatedAt: ISO8601DateFormatter().string(from: Date()), model: model,
-                            scope: "Actual TypeSafe HTTP on fixed public app descriptors and synthetic controls; target propagation is simulated; no OS actions or evidence of meeting creation",
+                            scope: "Deterministic exact labels and actual TypeSafe HTTP semantic decisions on fixed public app descriptors and synthetic controls; target propagation is simulated; no OS actions or evidence of meeting creation",
                             passed: results.filter(\.passed).count, total: results.count, results: results)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -239,11 +270,11 @@ private final class SequenceDecisionRecorder: URLProtocol, @unchecked Sendable {
             if let data, let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let answers = object["answers"] as? [String: [String: Any]] {
                 var decisions: [String] = []
-                for name in ["action", "application", "element"] {
+                for name in ["action", "application", "observed_control", "element"] {
                     guard let answer = answers[name], let confidence = answer["confidence"] as? Double else { continue }
                     let choice = answer["choice"] as? String ?? ""
                     let allowed = MacIntent(rawValue: choice) != nil || ["none", "current"].contains(choice) ||
-                        choice.range(of: #"^(app|group|element)_[0-9]+$"#, options: .regularExpression) != nil
+                        choice.range(of: #"^(app|group|element|control)_[0-9]+$"#, options: .regularExpression) != nil
                     decisions.append("\(name)=\(allowed ? choice : "unknown") confidence=\(confidence)")
                 }
                 Self.lock.lock()
