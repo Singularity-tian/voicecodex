@@ -13,6 +13,8 @@ enum SpeechFailure: LocalizedError {
 @MainActor
 final class RealtimeSTT {
     var onTranscript: ((String, Bool) -> Void)?
+    /// Confirmed endpoint segments, followed by a successful EOF remainder once.
+    var onUtterance: ((String) -> Void)?
     var onLevel: ((Float) -> Void)?
     var onStatus: ((String) -> Void)?
     var onError: ((Error) -> Void)?
@@ -48,6 +50,10 @@ final class RealtimeSTT {
         stream.onTranscript = { [weak self] text, final in
             guard let self, self.generation == token else { return }
             self.onTranscript?(text, final)
+        }
+        stream.onUtterance = { [weak self] text in
+            guard let self, self.generation == token else { return }
+            self.onUtterance?(text)
         }
         stream.onFailure = { [weak self] error in
             guard let self, self.generation == token else { return }
@@ -144,6 +150,7 @@ final class SonioxConnection {
 
     let audioSink: AsyncStream<Data>.Continuation
     var onTranscript: ((String, Bool) -> Void)?
+    var onUtterance: ((String) -> Void)?
     var onFailure: ((Error) -> Void)?
 
     private let audioStream: AsyncStream<Data>
@@ -153,7 +160,7 @@ final class SonioxConnection {
     private var reader: Task<Void, Never>?
     private var deadline: Task<Void, Never>?
     private var transcript = SonioxTranscript()
-    private var isFinishing = false
+    private(set) var isFinishing = false
     private var completion: Result<String, Error>?
     private var waiter: CheckedContinuation<String, Error>?
 
@@ -186,20 +193,7 @@ final class SonioxConnection {
                     case .string(let value): data = Data(value.utf8)
                     @unknown default: throw SpeechFailure.message("云端返回了无法识别的语音消息。")
                     }
-                    let finished = try self.transcript.ingest(data)
-                    self.onTranscript?(self.transcript.text, false)
-                    if finished {
-                        guard self.isFinishing else {
-                            throw SpeechFailure.message("语音连接提前结束，请重新录音。")
-                        }
-                        let text = self.transcript.confirmedText
-                        guard !text.isEmpty else {
-                            throw SpeechFailure.message("没有识别到语音，请按住快捷键重新说话。")
-                        }
-                        self.onTranscript?(text, true)
-                        self.complete(.success(text))
-                        return
-                    }
+                    if self.ingestServerMessage(data) { return }
                 }
             } catch {
                 guard !Task.isCancelled else { return }
@@ -233,6 +227,40 @@ final class SonioxConnection {
         }
     }
 
+    /// Shared by the socket reader and offline lifecycle tests. Returns true
+    /// once the connection has completed or failed and its reader should stop.
+    @discardableResult
+    func ingestServerMessage(_ data: Data) -> Bool {
+        guard completion == nil else { return true }
+        do {
+            let finished = try transcript.ingest(data)
+            if finished {
+                guard isFinishing else { throw SpeechFailure.message("语音连接提前结束，请重新录音。") }
+                guard !transcript.confirmedText.isEmpty else {
+                    throw SpeechFailure.message("没有识别到语音，请按住快捷键重新说话。")
+                }
+            }
+            onTranscript?(transcript.text, false)
+            guard completion == nil else { return true }
+            let utterances = transcript.takeUtterances(successfulEOF: finished)
+            for utterance in utterances {
+                guard completion == nil else { return true }
+                onUtterance?(utterance)
+            }
+            if finished {
+                guard completion == nil else { return true }
+                let text = transcript.confirmedText
+                onTranscript?(text, true)
+                complete(.success(text))
+                return true
+            }
+            return completion != nil
+        } catch {
+            fail(Self.safeError(error))
+            return true
+        }
+    }
+
     func finish() async throws -> String {
         if let completion { return try completion.get() }
         guard !isFinishing else { throw SpeechFailure.message("正在完成上一段语音，请稍候。") }
@@ -241,7 +269,7 @@ final class SonioxConnection {
         deadline = Task { [weak self] in
             do { try await Task.sleep(nanoseconds: 15_000_000_000) }
             catch { return }
-            self?.fail(SpeechFailure.message("云端识别超时，指令没有执行。请检查网络后重试。"))
+            self?.fail(SpeechFailure.message("云端识别超时，请检查网络后重试。"))
         }
         return try await withCheckedThrowingContinuation { waiter = $0 }
     }
@@ -259,6 +287,7 @@ final class SonioxConnection {
     private func complete(_ result: Result<String, Error>) {
         guard completion == nil else { return }
         completion = result
+        transcript.discardUtterances()
         audioSink.finish()
         writer?.cancel()
         reader?.cancel()
@@ -272,7 +301,40 @@ final class SonioxConnection {
     private static func safeError(_ error: Error) -> Error {
         if error is SpeechFailure || error is CancellationError { return error }
         // Provider responses and network descriptions must never echo credentials.
-        return SpeechFailure.message("无法连接云端语音服务，指令没有执行。请检查网络与 API Key 后重试。")
+        return SpeechFailure.message("无法连接云端语音服务，请检查网络与 API Key 后重试。")
+    }
+}
+
+/// Soniox final tokens arrive once and <end> follows a finalized utterance.
+/// Never call appendFinalToken for provisional tokens. <fin> is a protocol
+/// finalization marker, not an utterance boundary; only successful EOF flushes
+/// an otherwise unterminated confirmed tail.
+struct SonioxUtteranceAccumulator {
+    private var pending = ""
+    private var stopped = false
+
+    mutating func appendFinalToken(_ text: String) -> String? {
+        guard !stopped else { return nil }
+        if text == "<end>" { return flush() }
+        if text != "<fin>" { pending += text }
+        return nil
+    }
+
+    mutating func finish() -> String? {
+        guard !stopped else { return nil }
+        stopped = true
+        return flush()
+    }
+
+    mutating func discard() {
+        pending = ""
+        stopped = true
+    }
+
+    private mutating func flush() -> String? {
+        let text = pending.trimmingCharacters(in: .whitespacesAndNewlines)
+        pending = ""
+        return text.isEmpty ? nil : text
     }
 }
 
@@ -280,6 +342,8 @@ final class SonioxConnection {
 struct SonioxTranscript {
     private var confirmed = ""
     private var provisional = ""
+    private var utterance = SonioxUtteranceAccumulator()
+    private var pendingUtterances: [String] = []
     var text: String { (confirmed + provisional).trimmingCharacters(in: .whitespacesAndNewlines) }
     var confirmedText: String { confirmed.trimmingCharacters(in: .whitespacesAndNewlines) }
 
@@ -298,17 +362,32 @@ struct SonioxTranscript {
             case 401: throw SpeechFailure.message("Soniox API Key 无效或已过期，请更新配置。")
             case 402: throw SpeechFailure.message("Soniox 余额或用量额度不足，请检查账户。")
             case 429: throw SpeechFailure.message("Soniox 请求过于频繁，请稍后重试。")
-            default: throw SpeechFailure.message("Soniox 识别失败（\(code)），指令没有执行。")
+            default: throw SpeechFailure.message("Soniox 识别失败（\(code)），请重新录音。")
             }
         }
         if let tokens = result.tokens {
             provisional = ""
-            for token in tokens where token.text != "<end>" && token.text != "<fin>" {
-                if token.is_final { confirmed += token.text }
-                else { provisional += token.text }
+            for token in tokens {
+                if token.is_final, let segment = utterance.appendFinalToken(token.text) { pendingUtterances.append(segment) }
+                if token.text != "<end>" && token.text != "<fin>" {
+                    if token.is_final { confirmed += token.text }
+                    else { provisional += token.text }
+                }
             }
         }
         return result.finished == true
+    }
+
+    mutating func takeUtterances(successfulEOF: Bool = false) -> [String] {
+        if successfulEOF, let remainder = utterance.finish() { pendingUtterances.append(remainder) }
+        let result = pendingUtterances
+        pendingUtterances = []
+        return result
+    }
+
+    mutating func discardUtterances() {
+        utterance.discard()
+        pendingUtterances = []
     }
 }
 

@@ -105,12 +105,15 @@ final class LevelView: NSView {
 @MainActor
 final class MainView: NSView {
     let modeSelector = NSSegmentedControl(labels: ["控制 Mac · Jev", "编程 · Codex"], trackingMode: .selectOne, target: nil, action: nil)
+    let liveExecutionToggle = NSButton(checkboxWithTitle: "边说边做", target: nil, action: nil)
+    let shortcutHint = textLabel("停顿一句 · 执行一句", size: 12, color: Theme.muted)
     let heroTitle = textLabel("说一句，让 Mac 动起来。", size: 32, weight: .semibold)
     let heroSubtitle = textLabel("打开应用、新建标签页、输入文字。Jev 理解，Mac 执行。", size: 13, color: Theme.muted)
     let macTargetLabel = textLabel("此 Mac  /  Jev", size: 12, weight: .medium)
     let permissionsButton = NSButton(title: "启用辅助功能", target: nil, action: nil)
+    let screenPermissionButton = NSButton(title: "启用屏幕识别", target: nil, action: nil)
     let environmentButton = NSButton(title: "打开 .env", target: nil, action: nil)
-    let examplesButton = NSButton(title: "试试：在 Chrome 新建标签页 ↗", target: nil, action: nil)
+    let examplesButton = NSButton(title: "试试：打开腾讯会议，然后创建新会议 ↗", target: nil, action: nil)
     private var projectRow: NSStackView!
     private var macRow: NSStackView!
     let stateLabel = textLabel("●  准备就绪", size: 12, weight: .medium, color: Theme.green)
@@ -152,7 +155,7 @@ final class MainView: NSView {
         modeSelector.controlSize = .regular
         modeSelector.setAccessibilityLabel("执行模式")
         let hero = vstack([modeSelector, heroTitle, heroSubtitle], spacing: 12)
-        let shortcut = hstack([shortcutLabel, textLabel("按住说话 · 松开执行", size: 12, color: Theme.muted),
+        let shortcut = hstack([shortcutLabel, shortcutHint,
                               spacer(), level, recordButton], spacing: 16)
         recordButton.bezelStyle = .rounded
         recordButton.controlSize = .large
@@ -170,7 +173,7 @@ final class MainView: NSView {
         transcriptScroll.heightAnchor.constraint(equalToConstant: 70).isActive = true
         let transcriptHeading = hstack([textLabel("实时转写", size: 11, weight: .semibold, color: Theme.muted),
                                         spacer(), providerLabel])
-        let voiceContent = vstack([shortcut, separator(), transcriptHeading, transcriptScroll], spacing: 15)
+        let voiceContent = vstack([shortcut, liveExecutionToggle, separator(), transcriptHeading, transcriptScroll], spacing: 15)
         [shortcut, transcriptHeading, transcriptScroll].forEach { $0.widthAnchor.constraint(equalTo: voiceContent.widthAnchor).isActive = true }
         let voiceCard = CardView(content: voiceContent)
 
@@ -183,11 +186,11 @@ final class MainView: NSView {
         newTaskButton.font = .systemFont(ofSize: 11)
         projectRow = hstack([textLabel("当前项目", size: 11, color: Theme.muted), projectButton,
                                 spacer(), sessionLabel, newTaskButton])
-        [permissionsButton, environmentButton, examplesButton].forEach {
+        [permissionsButton, screenPermissionButton, environmentButton, examplesButton].forEach {
             $0.bezelStyle = .inline
             $0.font = .systemFont(ofSize: 11)
         }
-        macRow = hstack([macTargetLabel, spacer(), environmentButton, permissionsButton])
+        macRow = hstack([macTargetLabel, spacer(), environmentButton, permissionsButton, screenPermissionButton])
 
         setupTextView(results, font: .systemFont(ofSize: 13))
         results.string = "这里记录你发送的语音和文字指令。\n\n完整执行过程、审批提示和结果会在 Terminal 的 Codex 会话中显示。\n每个新任务使用独立工作目录；继续说话会沿用同一个会话。"
@@ -227,7 +230,7 @@ final class MainView: NSView {
         sendButton.controlSize = .large
         sendButton.contentTintColor = Theme.green
         let inputRow = hstack([commandField, sendButton])
-        let footer = hstack([footerLabel, spacer(), textLabel("DEMO  ·  0.3", size: 9, weight: .medium, color: Theme.muted)])
+        let footer = hstack([footerLabel, spacer(), textLabel("DEMO  ·  0.4.2", size: 9, weight: .medium, color: Theme.muted)])
 
         let layout = vstack([top, hero, voiceCard, macRow, projectRow, resultCard, examplesButton, inputRow, footer], spacing: 16)
         layout.setCustomSpacing(28, after: top)
@@ -249,14 +252,15 @@ final class MainView: NSView {
 
     func configureMode(mac: Bool) {
         modeSelector.selectedSegment = mac ? 0 : 1
-        heroTitle.stringValue = mac ? "说一句，让 Mac 动起来。" : "说一句，交给 Codex。"
-        heroSubtitle.stringValue = mac ? "打开应用、新建标签页、输入文字。Jev 理解，Mac 执行。" : "松手后，在 Terminal 里执行并显示过程。"
+        heroTitle.stringValue = mac ? "边说，边让 Mac 动起来。" : "说一句，交给 Codex。"
+        heroSubtitle.stringValue = mac ? "连续动作直接执行，点击后检查界面变化。Esc 随时停止。" : "松手后，在 Terminal 里执行并显示过程。"
         projectRow.isHidden = mac
         macRow.isHidden = !mac
         examplesButton.isHidden = !mac
+        liveExecutionToggle.isHidden = !mac
         openWorktreeButton.isHidden = mac
         openTerminalButton.isHidden = mac
-        commandField.placeholderString = mac ? "例如：打开便笺；然后说：输入「hello world」" : "输入指令，按回车发送到 Terminal…"
+        commandField.placeholderString = mac ? "例如：打开 Chrome，然后新建一个标签页" : "输入指令，按回车发送到 Terminal…"
         footerLabel.stringValue = mac ? "音频和 App 热词发送至 Soniox；指令和必要的控件文字发送至 TypeSafe。Esc 随时停止。" : "音频和 App 热词发送至 Soniox。Esc 取消录音。执行与审批在 Terminal 中进行。"
     }
 

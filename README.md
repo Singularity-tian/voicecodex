@@ -2,7 +2,7 @@
 
 **Hold a key. Say what you need. Control your Mac.**
 
-A native macOS voice controller with two modes: **Jev** selects native Mac actions, and **Codex** continues your coding session in Terminal. Soniox provides live Chinese / English transcription. Hold the shortcut from another app and release to execute.
+A native macOS voice controller with two modes: **Jev** selects native Mac actions, and **Codex** continues your coding session in Terminal. Soniox provides live Chinese / English transcription. In Mac mode, hold the shortcut from another app and pause between instructions: confirmed sentences start executing while the microphone remains open. Coding mode submits on release.
 
 Chinese and English can be mixed in one command. Every recording automatically loads installed App names and common Chinese/English aliases as Soniox vocabulary, prioritizing the current and running apps. The transcription panel shows the loaded hotword count; no manual language switch is needed.
 
@@ -16,26 +16,30 @@ Inspired by [this Jev voice-control demo](https://www.youtube.com/shorts/vSzde5b
 2. Choose **控制 Mac · Jev** and click **打开 .env**. Fill `TYPESAFE_API_KEY` with your TypeSafe key. The default model is pinned to `jev-1.13.0`. Save the file; the next command reloads it.
 3. Set a Soniox key in Settings, or set `SONIOX_API_KEY` in `.env`. An existing saved Soniox key is reused when the `.env` value is blank.
 4. Click **启用辅助功能** and enable VoiceCodex in macOS System Settings. Microphone access is requested on first recording.
-5. Hold **Control + Option + Space**, say one action, and release. **Esc** stops recording or further Mac actions. The text field uses the same Jev execution path.
+5. Leave **边说边做** enabled, hold **Control + Option + Space**, and speak. Pause after a sentence to begin execution before releasing the key. Release ends listening and flushes only the remaining confirmed text. **Esc** stops listening and clears later actions. Turn the checkbox off to execute after release. The text field supports the same sequences.
 
-Try these commands, one at a time:
+Try these commands:
 
 | Say | Action |
 | --- | --- |
 | “打开 Chrome” / “Open Calculator” | Open or activate an installed app |
 | “在 Chrome 新建一个标签页” | Send ⌘T to Chrome |
 | “关闭当前标签页” | Close only the current browser tab with ⌘W |
-| “打开便笺” → “新建一个窗口” | Open Stickies, then create a note |
+| “打开 Chrome，然后新建一个标签页” | Open Chrome, then act in that same app |
+| “打开腾讯会议，然后创建一个新的会议” | Open Tencent Meeting, then click its observed new/quick-meeting control |
 | “输入「hello world」” / “Type hello world” | Insert your literal text at the focused editor's selection |
 | “向下滚动” / “复制” / “撤销” | Operate the captured target app |
 | “点击保存按钮” | Choose from observed, enabled Accessibility controls |
-| “关闭 Chrome 的所有窗口” | Review, then close observed windows; stop at a save dialog |
+| “快速会议。” / “Quick Meeting” | Match a unique visible control in the current app without requiring a click verb |
+| “关闭 Chrome 的所有窗口” | Close observed windows; stop at a save dialog |
 
-Jev chooses from a fixed action vocabulary and observed app/control IDs. It does not generate prose, scripts, shell commands, or text to type. Literal typing content is held locally and hidden from action selection, so saying “输入「打开 Chrome」” enters those words. Say one operation per command; compound research/writing workflows are not implemented in Mac mode. Typing preserves the rest of an editable field and does not press Return. Protected fields and terminal input are blocked. Apps that do not expose usable Accessibility controls may need a manual click first.
+Jev chooses from a fixed action vocabulary and observed app/control IDs. It does not generate prose, scripts, shell commands, or text to type. Literal typing content is held locally and hidden from action selection, so saying “输入「打开 Chrome」” enters those words. Connect up to six explicit actions with “然后”, “接着”, “再”, “then”, or “and then”. Quoted content is never split: `输入「先打开，再关闭」然后按回车` types the exact quoted text, then presses Return. Open-ended research/writing workflows are not implemented in Mac mode. Typing preserves the rest of an editable field and does not press Return unless requested. Protected fields and terminal input are blocked. When an app exposes no usable Accessibility buttons, optional **屏幕识别** reads only its target window using Apple Vision locally. Jev receives bounded recognized labels, never the screenshot. The app automatically rechecks the target window, label, and position immediately before clicking. This needs macOS Screen Recording permission in addition to Accessibility. Unlabeled icons and ambiguous or changing targets stop the action.
 
-The target for an unnamed app is captured when recording starts. Named apps can be selected explicitly. Return, paste, clicking a control, and closing all windows have an in-app review step. A cancellation stops later actions; it does not undo input already delivered. Receipts distinguish observed changes from shortcuts whose final effect cannot be verified.
+For terse commands, planning can use bounded visible controls from the captured current app. Exact unique button names resolve locally; local goals such as “开个会” and “约个会” use Jev with the observed choices. Literal text and explicitly different app destinations cannot borrow that context. For custom-drawn launchers, local image geometry can associate a caption with a uniquely aligned colored tile and click the tile itself. The association is rechecked before input.
 
-“关闭窗口” closes the whole window, including its tabs. Use “关闭当前标签页” for one tab. New-tab and new-window commands can launch a stopped target app. Confirmation binds to the selected process, window, and input field; changing them while reviewing stops the action.
+The initial unnamed target is captured when recording starts. Each successful action carries its app target to the next step, including later sentences in the same recording. Planning and fresh observation happen one step at a time. Up to 12 pending steps can queue; a failed, rejected, or cancelled step discards the rest and ends live listening. All supported Jev actions execute directly without an in-app confirmation popup, including Return, paste, control clicks, and closing all windows. Esc stops later actions; it does not undo input already delivered. Clicks now wait for two consistent observations of changed window or control content. No visible change or an unreadable result stops the queue with an explicit unverified receipt; the click is not blindly repeated. A UI transition is evidence of a response, not proof that an external task such as sending or creating a meeting finished.
+
+“关闭窗口” closes the whole window, including its tabs. Use “关闭当前标签页” for one tab. New-tab and new-window commands can launch a stopped target app. Automatic checks bind input to the selected process, window, and field; a real target change before input stops the action.
 
 ### Local `.env`
 
@@ -68,14 +72,23 @@ Requires macOS 14+, Xcode Command Line Tools / Swift 5.9+, and a [Soniox API key
 ```sh
 git clone https://github.com/Singularity-tian/voicecodex.git
 cd voicecodex
-./script/build_and_run.sh --install
+# Select and remember your signing identity using the command below.
 ```
 
 Terminal mode requires a CLI with `--remote` and the app-server queue API; tested with **Codex CLI 0.153.2**.
 
-The script builds a local app bundle, signs it ad hoc, installs it at `~/Applications/VoiceCodex.app`, and launches it. It is a source-built demo, not a notarized distribution.
+The script builds and signs a local app bundle, installs it at `~/Applications/VoiceCodex.app`, and launches it. This is the current user's Applications folder. The app is a source-built demo, not a notarized distribution.
 
-Developers with a signing certificate can set `VOICECODEX_SIGNING_IDENTITY` to their own identity when building. A stable signing identity avoids repeated permission resets as the app changes.
+For stable permissions across updates, choose an exact certificate name or full fingerprint from `security find-identity -v -p codesigning`, then install once with:
+
+```sh
+VOICECODEX_SIGNING_IDENTITY="YOUR CODE-SIGNING CERTIFICATE FINGERPRINT" \
+  ./script/build_and_run.sh --install --remember-signing-identity
+```
+
+Only after the installed signature verifies does the script save the fingerprint in `~/Library/Application Support/VoiceCodex/signing-identity` (mode `0600`). Later builds reuse it; `VOICECODEX_SIGNING_IDENTITY` takes precedence. An unavailable saved identity stops the build instead of falling back to ad hoc signing. Switching signing identities may require one new permission grant. Continue using `--install` to update and launch the same app location.
+
+Without a configured identity, `--build-only` supports ad hoc CI builds. An intentional temporary run/install can use `VOICECODEX_SIGNING_IDENTITY=-`; ad hoc identities cannot be remembered and changing those builds can require renewed permissions. The saved identity is literal local data, never shell code, and does not contain a private key.
 
 1. Open **设置**, enter your Soniox key and check the Codex executable path. VoiceCodex reuses your existing `codex login` authentication.
 2. Click **选择项目** and pick a Git repository with at least one commit.
@@ -99,9 +112,9 @@ You can also hold the **按住说话** button, or type a prompt in the bottom fi
 
 - Audio is captured only for an explicit recording and streamed to **Soniox**. VoiceCodex keeps audio in memory and does not save recordings.
 - Each recording also sends **Soniox** a bounded vocabulary of installed App display names and known aliases. It contains no app paths, window titles, documents, or history; see [speech configuration](docs/soniox.md).
-- The app waits for Soniox's final completion response. A network or transcription error does not execute a partial transcript.
+- Mac live mode executes only finalized Soniox utterances (`<end>`), never provisional words. It submits the final confirmed remainder once at a successful EOF. A later network/transcription error stops pending actions; actions already delivered remain. With live mode off, and in Codex mode, submission waits for final completion.
 - Final text is sent to **Codex**, using the account and provider configuration already configured for your CLI.
-- In Mac mode, the routing instruction and app names/identifiers are sent to **TypeSafe**. Recognized literal typing payloads are replaced with a placeholder and remain local during planning. A click command additionally sends bounded Accessibility role/title/description text for the selected window. Screenshots, clipboard contents, and whole documents are not sent to Jev. Transcripts and action receipts are saved privately in `mac-history.txt`, separately from the coding session history.
+- In Mac mode, the routing instruction and app names/identifiers are sent to **TypeSafe**. Recognized literal typing payloads are replaced with a placeholder and remain local during planning. Contextual planning and control selection may send bounded Accessibility control labels or OCR labels from the current target window. Screenshots, tile detection, and post-click observations stay local in memory; screenshots are never saved or uploaded. Clipboard contents and whole documents are not sent to Jev. Transcripts and action receipts are saved privately in `mac-history.txt`, separately from the coding session history.
 - Settings, the Soniox credential, session IDs, and local transcript/output history live in `~/Library/Application Support/VoiceCodex/`. Config and history files use mode `0600`.
 - Task worktrees live under that directory's `worktrees/`. They are preserved when you start a new task; remove finished ones with `git worktree remove` when ready.
 - The Soniox key is used by the voice app and is not added to the Codex child-process environment. `SONIOX_API_KEY` is also supported for explicitly configured development launches.
@@ -130,6 +143,8 @@ For opt-in real API checks and disposable desktop scenarios, see [the QA guide](
 | `RealtimeSTT` | AVAudioEngine capture, PCM conversion, Soniox streaming and finalization |
 | `JevClient` | Typed action/app/control selection, confidence and response validation |
 | `MacControlDriver` | Native app activation, targeted input, bounded AX reads and receipts |
+| `MacCommandSequence` / `MacSequenceExecutor` | Quote-aware ordered steps, serial queue, target carry and stop-on-failure |
+| `VisualControlObserver` | Optional local target-window OCR and fresh candidate matching |
 | `EnvironmentFile` | Literal `.env` parsing without shell execution |
 | `AppController` | Recording lifecycle, prompt queue, session selection and local state |
 | `TerminalSession` | Authenticated local app-server, literal JSON prompts, queue, status and interruption |

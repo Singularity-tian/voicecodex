@@ -6,6 +6,7 @@ struct LocalConfig: Codable {
     var jevAPIKey: String = ""
     var jevModel: String = "jev-1.13.0"
     var executionMode: String = "mac"
+    var liveMacExecution = true
     var codexPath: String = ""
     var projectPath: String?
     var workspacePath: String?
@@ -14,7 +15,7 @@ struct LocalConfig: Codable {
     var envFile: URL = LocalConfig.directory.appendingPathComponent(".env")
 
     private enum CodingKeys: String, CodingKey {
-        case sonioxAPIKey, jevAPIKey, jevModel, executionMode, codexPath, projectPath, workspacePath, sessionID
+        case sonioxAPIKey, jevAPIKey, jevModel, executionMode, liveMacExecution, codexPath, projectPath, workspacePath, sessionID
     }
 
     static let directory = FileManager.default.homeDirectoryForCurrentUser
@@ -31,6 +32,7 @@ struct LocalConfig: Codable {
             config.jevAPIKey = json["jevAPIKey"] as? String ?? ""
             config.jevModel = nonblank(json["jevModel"] as? String) ?? config.jevModel
             config.executionMode = nonblank(json["executionMode"] as? String) ?? config.executionMode
+            config.liveMacExecution = json["liveMacExecution"] as? Bool ?? true
             config.codexPath = json["codexPath"] as? String ?? ""
             config.projectPath = json["projectPath"] as? String
             config.workspacePath = json["workspacePath"] as? String
