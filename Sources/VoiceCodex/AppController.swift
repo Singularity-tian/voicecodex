@@ -20,7 +20,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var macStatus = "等待语音指令"
     private var recordingTargetID: String?
     private var activationObserver: NSObjectProtocol?
-    private var confirmationAlert: NSAlert?
     private var isMacMode: Bool { config.executionMode == "mac" }
     private var terminal: TerminalSession?
     private var terminalLaunch: TerminalLaunchFiles?
@@ -396,19 +395,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     if self.macDriver.needsAccessibility(for: command.intent), !self.macDriver.accessibilityGranted {
                         throw DemoError.message("需要辅助功能权限来执行这个动作。点击「启用辅助功能」，在系统设置中允许 VoiceCodex 后重试。")
                     }
-                    if command.intent == .clickElement { try await self.macDriver.waitForInterface(command: command) }
-                    var confirmationContext: MacControlDriver.ConfirmationContext?
-                    if self.macDriver.requiresConfirmation(command) && command.intent != .clickElement {
+                    if [.clickElement, .paste, .pressReturn, .closeAllWindows].contains(command.intent) {
                         try await self.macDriver.waitForInterface(command: command)
-                        confirmationContext = try await self.macDriver.captureConfirmationContext(command: command)
-                        guard await self.confirmMacAction(command, description: description, goal: step.text) else {
-                            throw CancellationError()
-                        }
                     }
                     try Task.checkCancellation()
-                    return try await self.macDriver.execute(command: command, goal: step.text, jev: client, context: confirmationContext, confirmClick: { label in
-                        await self.confirmMacAction(command, description: description, goal: step.text + "\n点击目标：" + label)
-                    })
+                    return try await self.macDriver.execute(command: command, goal: step.text, jev: client)
                 }, onStep: { step in
                     self.macStatus = "步骤 \(step.index)/\(step.total) · Jev 正在理解…"
                     self.updateState()
@@ -429,24 +420,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
         updateState()
-    }
-
-    private func confirmMacAction(_ command: MacCommand, description: String, goal: String) async -> Bool {
-        guard !Task.isCancelled, !terminating else { return false }
-        let alert = NSAlert()
-        alert.messageText = description
-        alert.informativeText = "指令：\(goal)\n确认后继续后面的步骤。此动作可能提交内容或关闭窗口，请核对目标。" + (command.text.map { "\n文字：\($0)" } ?? "")
-        alert.addButton(withTitle: "执行")
-        alert.addButton(withTitle: "取消")
-        confirmationAlert = alert
-        showWindow()
-        updateState()
-        let response = await withCheckedContinuation { continuation in
-            alert.beginSheetModal(for: window) { continuation.resume(returning: $0) }
-        }
-        confirmationAlert = nil
-        updateState()
-        return response == .alertFirstButtonReturn && !Task.isCancelled
     }
 
     private func actionName(_ intent: MacIntent) -> String {
@@ -763,7 +736,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if isMacMode {
             macSequence.clear()
             macTask?.cancel()
-            if let alert = confirmationAlert { window.endSheet(alert.window, returnCode: .cancel) }
             if recordingState != .idle { cancelRecording() }
             macStatus = executing ? "正在停止…" : "已停止"
             updateState()
@@ -900,11 +872,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let state: String
         switch recordingState {
         case .starting: state = "正在连接"
-        case .recording: state = isMacMode && executing ? (confirmationAlert == nil ? "正在听 · 正在执行" : "正在听 · 等待确认") : "正在听"
+        case .recording: state = isMacMode && executing ? "正在听 · 正在执行" : "正在听"
         case .finishing: state = "正在转写"
         case .idle:
             if isMacMode {
-                state = executing ? (confirmationAlert == nil ? "正在执行" : "等待确认") : (!lastError.isEmpty ? "需要留意" : (config.jevAPIKey.isEmpty ? "等待 Jev key" : "准备就绪"))
+                state = executing ? "正在执行" : (!lastError.isEmpty ? "需要留意" : (config.jevAPIKey.isEmpty ? "等待 Jev key" : "准备就绪"))
             } else {
                 state = executing ? (waitingForApproval ? "请在终端确认" : (submitting ? "正在发送" : "终端执行中")) :
                     (!lastError.isEmpty ? "需要留意" : (config.sonioxAPIKey.isEmpty ? "等待配置" : "准备就绪"))
@@ -1037,7 +1009,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         speech?.cancel()
         macTask?.cancel()
-        if let alert = confirmationAlert { window.endSheet(alert.window, returnCode: .cancel) }
         closeTerminalConnection()
         runTask?.cancel()
         hotkey.unregister()

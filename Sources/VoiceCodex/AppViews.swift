@@ -253,7 +253,7 @@ final class MainView: NSView {
     func configureMode(mac: Bool) {
         modeSelector.selectedSegment = mac ? 0 : 1
         heroTitle.stringValue = mac ? "边说，边让 Mac 动起来。" : "说一句，交给 Codex。"
-        heroSubtitle.stringValue = mac ? "一句多个动作，依次执行。按住说话，停顿时开始处理。" : "松手后，在 Terminal 里执行并显示过程。"
+        heroSubtitle.stringValue = mac ? "一句多个动作，依次直接执行。停顿就开始，Esc 随时停止。" : "松手后，在 Terminal 里执行并显示过程。"
         projectRow.isHidden = mac
         macRow.isHidden = !mac
         examplesButton.isHidden = !mac

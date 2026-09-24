@@ -1,5 +1,6 @@
 import ApplicationServices
 import XCTest
+import VoiceCodexCore
 @testable import VoiceCodex
 
 final class MacControlDriverTests: XCTestCase {
@@ -112,6 +113,33 @@ final class MacControlDriverTests: XCTestCase {
                        "AXButton · Create meeting")
     }
 
+    func testWindowOwnershipFallbackDoesNotLookThroughAnotherAppsOverlay() {
+        let bounds = CGRect(x: -800, y: 50, width: 700, height: 500)
+        let target = MacControlDriver.HitWindow(processID: 42, windowID: 10, bounds: bounds, alpha: 1)
+        let overlay = MacControlDriver.HitWindow(processID: 99, windowID: 20, bounds: bounds, alpha: 1)
+        let point = CGPoint(x: -450, y: 300)
+        XCTAssertEqual(MacControlDriver.frontmostWindow(at: point, in: [overlay, target])?.windowID, 20)
+        XCTAssertEqual(MacControlDriver.frontmostWindow(at: point, in: [target, overlay])?.windowID, 10)
+    }
+
+    func testWindowOwnershipFallbackDoesNotConfuseTwoWindowsInTheSameApp() {
+        let bounds = CGRect(x: 100, y: 50, width: 700, height: 500)
+        let target = MacControlDriver.HitWindow(processID: 42, windowID: 10, bounds: bounds, alpha: 1)
+        let secondWindow = MacControlDriver.HitWindow(processID: 42, windowID: 11, bounds: bounds, alpha: 1)
+        XCTAssertEqual(MacControlDriver.frontmostWindow(at: CGPoint(x: 400, y: 300), in: [secondWindow, target])?.windowID, 11)
+    }
+
+    func testWindowOwnershipFallbackSkipsInvisibleAndNonOverlappingWindowsOnly() {
+        let target = MacControlDriver.HitWindow(processID: 42, windowID: 10,
+            bounds: CGRect(x: 100, y: 50, width: 700, height: 500), alpha: 1)
+        let invisible = MacControlDriver.HitWindow(processID: 99, windowID: 20, bounds: target.bounds, alpha: 0)
+        let elsewhere = MacControlDriver.HitWindow(processID: 99, windowID: 21,
+            bounds: target.bounds.offsetBy(dx: 900, dy: 0), alpha: 1)
+        XCTAssertEqual(MacControlDriver.frontmostWindow(at: CGPoint(x: 400, y: 300), in: [invisible, elsewhere, target])?.windowID, 10)
+        XCTAssertNil(MacControlDriver.frontmostWindow(at: CGPoint(x: -500, y: -500), in: [target]))
+        XCTAssertNil(MacControlDriver.frontmostWindow(at: CGPoint(x: CGFloat.nan, y: 300), in: [target]))
+    }
+
     @MainActor
     func testStopQueuedDuringSynchronousInspectionPreventsThePendingWrite() async throws {
         var stopDelivered = false
@@ -146,6 +174,242 @@ final class MacControlDriverTests: XCTestCase {
         }
         XCTAssertEqual(result, "delivered")
         XCTAssertEqual(writes, 1)
+    }
+
+    @MainActor
+    func testNewWindowObservationWaitsThroughUnreadableAndUnchangedSnapshots() async throws {
+        var reads: [[Int]?] = [nil, [1], [1], [1, 2]]
+        var waits = 0
+        let result = try await MacControlDriver.observeWindowTransition(attempts: 4,
+            read: { reads.removeFirst() }, until: { $0.contains(2) }, wait: { waits += 1 })
+        XCTAssertTrue(result.completed)
+        XCTAssertEqual(result.windows, [1, 2])
+        XCTAssertEqual(waits, 3)
+        XCTAssertTrue(reads.isEmpty)
+    }
+
+    @MainActor
+    func testCloseWindowObservationWaitsUntilTheSpecificWindowDisappears() async throws {
+        var reads: [[Int]?] = [[1, 2], nil, [1, 2], [2]]
+        var waits = 0
+        let result = try await MacControlDriver.observeWindowTransition(attempts: 5,
+            read: { reads.removeFirst() }, until: { !$0.contains(1) }, wait: { waits += 1 })
+        XCTAssertTrue(result.completed)
+        XCTAssertEqual(result.windows, [2])
+        XCTAssertEqual(waits, 3)
+        XCTAssertTrue(reads.isEmpty)
+    }
+
+    @MainActor
+    func testInitialSnapshotRetriesFailuresAndAcceptsAnActuallyReadableEmptyList() async throws {
+        var attempts = 0
+        let result: MacControlDriver.WindowObservation<Int> = try await MacControlDriver.observeWindowTransition(attempts: 3,
+            read: {
+                attempts += 1
+                if attempts == 1 { throw MacControlError.windowStateUnreadable(AXError.cannotComplete.rawValue) }
+                if attempts == 2 { return nil }
+                return []
+            }, until: { _ in true }, wait: {})
+        XCTAssertTrue(result.completed)
+        XCTAssertEqual(result.windows, [])
+        XCTAssertNil(result.readError)
+        XCTAssertEqual(attempts, 3)
+    }
+
+    @MainActor
+    func testUnchangedWindowListTimesOutInsteadOfReportingSuccess() async throws {
+        var reads = 0
+        var waits = 0
+        let result = try await MacControlDriver.observeWindowTransition(attempts: 4,
+            read: { reads += 1; return [1] }, until: { !$0.contains(1) }, wait: { waits += 1 })
+        XCTAssertFalse(result.completed)
+        XCTAssertEqual(result.windows, [1])
+        XCTAssertEqual(reads, 4)
+        XCTAssertEqual(waits, 3)
+    }
+
+    @MainActor
+    func testNoValueDoesNotMeanNoWindowsAndPreservesTheLatestAXFailure() async throws {
+        var attempts = 0
+        let result = try await MacControlDriver.observeWindowTransition(attempts: 3,
+            read: { () throws -> [Int]? in
+                attempts += 1
+                if attempts == 1 { return [1] }
+                throw MacControlError.windowStateUnreadable(AXError.noValue.rawValue)
+            }, until: { !$0.contains(1) }, wait: {})
+        XCTAssertFalse(result.completed)
+        XCTAssertNil(result.windows)
+        guard case .windowStateUnreadable(let code) = result.readError else {
+            return XCTFail("Keep the failed AX read distinct from a readable empty list")
+        }
+        XCTAssertEqual(code, AXError.noValue.rawValue)
+        XCTAssertTrue(result.readError?.localizedDescription.contains(String(code)) == true)
+        XCTAssertEqual(attempts, 3)
+    }
+
+    @MainActor
+    func testDialogStopsWindowObservationWithoutConsumingLaterSnapshots() async throws {
+        var reads = 0
+        var waits = 0
+        do {
+            _ = try await MacControlDriver.observeWindowTransition(attempts: 5,
+                read: { () throws -> [Int]? in
+                    reads += 1
+                    if reads == 2 { throw MacControlError.blockedByDialog }
+                    return [1]
+                }, until: { !$0.contains(1) }, wait: { waits += 1 })
+            XCTFail("A dialog must stop subsequent close actions")
+        } catch MacControlError.blockedByDialog {
+            XCTAssertEqual(reads, 2)
+            XCTAssertEqual(waits, 1)
+        }
+    }
+
+    @MainActor
+    func testCancellationDuringObservationWaitPropagatesBeforeAnotherRead() async throws {
+        var reads = 0
+        do {
+            _ = try await MacControlDriver.observeWindowTransition(attempts: 5,
+                read: { reads += 1; return [1] }, until: { !$0.contains(1) },
+                wait: { throw CancellationError() })
+            XCTFail("Cancellation must not be converted into an uncertain receipt")
+        } catch is CancellationError {
+            XCTAssertEqual(reads, 1)
+        }
+    }
+
+    @MainActor
+    func testCancellationDuringSuccessfulReadCannotReturnACompletedReceipt() async throws {
+        let operation = Task { @MainActor in
+            try await MacControlDriver.observeWindowTransition(attempts: 3,
+                read: { () -> [Int]? in
+                    withUnsafeCurrentTask { $0?.cancel() }
+                    return []
+                }, until: { $0.isEmpty }, wait: {})
+        }
+        do {
+            _ = try await operation.value
+            XCTFail("Cancellation wins even when the final read sees the requested state")
+        } catch is CancellationError {}
+    }
+
+    @MainActor
+    func testVisualNoMatchReplansOnceWhenLoadingContentChanges() async throws {
+        let initial = visualSnapshot(text: "正在加载")
+        let loaded = visualSnapshot(text: "预定会议")
+        var observations = 0, choices = 0
+        let (snapshot, choice) = try await MacControlDriver.chooseVisualTarget(from: initial,
+            observe: { observations += 1; return loaded }, validate: {}, choose: { snapshot in
+                choices += 1
+                if choices == 1 { throw JevClientError.unsupportedCommand }
+                XCTAssertEqual(snapshot.candidates.first?.text, "预定会议")
+                return "visual_1"
+            })
+        XCTAssertEqual(observations, 1)
+        XCTAssertEqual(choices, 2)
+        XCTAssertEqual(snapshot.candidates.first?.text, "预定会议")
+        XCTAssertEqual(choice, "visual_1")
+    }
+
+    @MainActor
+    func testVisualNoMatchDoesNotReplanForIDChangesChevronNoiseOrSmallJitter() async throws {
+        let initial = visualSnapshot(text: "预定会议丶")
+        let equivalent = visualSnapshot(text: "预定会议～", id: "visual_9", x: 0.204)
+        var choices = 0, observations = 0
+        do {
+            _ = try await MacControlDriver.chooseVisualTarget(from: initial,
+                observe: { observations += 1; return equivalent }, validate: {}, choose: { _ in
+                    choices += 1
+                    throw JevClientError.unsupportedCommand
+                })
+            XCTFail("Unchanged evidence must not trigger another model request")
+        } catch JevClientError.unsupportedCommand {
+            XCTAssertEqual(observations, 1)
+            XCTAssertEqual(choices, 1)
+        }
+    }
+
+    @MainActor
+    func testVisualNoMatchStopsAfterTheOneChangedSnapshotRetry() async throws {
+        var observations = 0, choices = 0
+        do {
+            _ = try await MacControlDriver.chooseVisualTarget(from: visualSnapshot(text: "正在加载"),
+                observe: { observations += 1; return self.visualSnapshot(text: "预定会议") }, validate: {}, choose: { _ in
+                    choices += 1
+                    throw JevClientError.unsupportedCommand
+                })
+            XCTFail("No recursive model retries")
+        } catch JevClientError.unsupportedCommand {
+            XCTAssertEqual(observations, 1)
+            XCTAssertEqual(choices, 2)
+        }
+    }
+
+    @MainActor
+    func testVisualPlanningDoesNotRetryLowConfidenceNetworkOrInvalidInput() async throws {
+        for failure in [JevClientError.lowConfidence(0.4), .networkUnavailable, .invalidInput, .requestFailed(statusCode: 429)] {
+            var observations = 0, choices = 0
+            do {
+                _ = try await MacControlDriver.chooseVisualTarget(from: visualSnapshot(text: "预定会议"),
+                    observe: { observations += 1; return self.visualSnapshot(text: "创建会议") }, validate: {}, choose: { _ in
+                        choices += 1
+                        throw failure
+                    })
+                XCTFail("Only unsupportedCommand can refresh evidence")
+            } catch let error as JevClientError {
+                XCTAssertEqual(error, failure)
+                XCTAssertEqual(observations, 0)
+                XCTAssertEqual(choices, 1)
+            }
+        }
+    }
+
+    @MainActor
+    func testVisualRefreshRejectsChangedWindowBeforeAnotherModelChoice() async throws {
+        let initial = visualSnapshot(text: "正在加载")
+        for changed in [visualSnapshot(text: "预定会议", processID: 43),
+                        visualSnapshot(text: "预定会议", windowID: 8),
+                        visualSnapshot(text: "预定会议", bounds: CGRect(x: 120, y: 50, width: 700, height: 500))] {
+            var choices = 0
+            do {
+                _ = try await MacControlDriver.chooseVisualTarget(from: initial, observe: { changed }, validate: {}, choose: { _ in
+                    choices += 1
+                    throw JevClientError.unsupportedCommand
+                })
+                XCTFail("Changed window identities cannot be replanned")
+            } catch MacControlError.visualTargetChanged {
+                XCTAssertEqual(choices, 1)
+            }
+        }
+    }
+
+    @MainActor
+    func testVisualRefreshPropagatesCancellationAndFocusChangesBeforeReplanning() async throws {
+        for cancelled in [false, true] {
+            var choices = 0, validations = 0
+            do {
+                _ = try await MacControlDriver.chooseVisualTarget(from: visualSnapshot(text: "正在加载"),
+                    observe: {
+                        if cancelled { throw CancellationError() }
+                        return self.visualSnapshot(text: "预定会议")
+                    }, validate: {
+                        validations += 1
+                        if !cancelled, validations == 3 { throw MacControlError.focusChanged }
+                    }, choose: { _ in choices += 1; throw JevClientError.unsupportedCommand })
+                XCTFail("Cancelled or changed-focus planning must stop")
+            } catch is CancellationError { XCTAssertTrue(cancelled) }
+            catch MacControlError.focusChanged { XCTAssertFalse(cancelled) }
+            XCTAssertEqual(choices, 1)
+        }
+    }
+
+    @MainActor
+    private func visualSnapshot(text: String, id: String = "visual_1", x: CGFloat = 0.2,
+                                processID: pid_t = 42, windowID: CGWindowID = 7,
+                                bounds: CGRect = CGRect(x: 100, y: 50, width: 700, height: 500)) -> VisualControlObserver.Snapshot {
+        VisualControlObserver.Snapshot(processID: processID, windowID: windowID, bounds: bounds, candidates: [
+            .init(id: id, text: text, normalizedBox: CGRect(x: x, y: 0.2, width: 0.2, height: 0.05))
+        ])
     }
 
     private static func delayedReadFixture() {

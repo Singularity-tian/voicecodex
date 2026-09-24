@@ -21,7 +21,7 @@ enum VisualControlError: LocalizedError {
 
 /// Reads one explicitly matched window. Images remain in memory, and only
 /// bounded OCR labels leave this class. Text is not proof of an enabled control;
-/// the caller must confirm, reobserve, and validate the target before clicking.
+/// the caller must reobserve and validate the target before clicking.
 @MainActor
 final class VisualControlObserver {
     struct Candidate: Equatable, Sendable {
@@ -113,7 +113,17 @@ final class VisualControlObserver {
             try Task.checkCancellation()
             return (request.results ?? []).compactMap { observation in
                 guard let text = observation.topCandidates(1).first else { return nil }
-                return TextObservation(text: text.string, confidence: text.confidence, visionBox: observation.boundingBox)
+                let raw = text.string
+                let contentRange = Self.labelContentRange(in: raw)
+                // An adjacent dropdown chevron can become 丶 or ～ between
+                // frames. Measure the label itself so that changing chevron OCR
+                // cannot shift the click point or make an unchanged box stale.
+                let contentBox: CGRect?
+                if contentRange != raw.startIndex..<raw.endIndex {
+                    contentBox = (try? text.boundingBox(for: contentRange))?.boundingBox
+                } else { contentBox = nil }
+                return TextObservation(text: raw, confidence: text.confidence,
+                                       visionBox: contentBox ?? observation.boundingBox)
             }
         }
         let observations = try await withTaskCancellationHandler {
@@ -144,8 +154,8 @@ final class VisualControlObserver {
         guard validBounds(bounds) else { return [] }
         let usable: [(String, CGRect)] = observations.compactMap { observation in
             // Vision assigns 0.3 to readable meeting labels when an adjacent
-            // chevron becomes part of the line. OCR proposes text only; exact
-            // user confirmation and fresh unique/geometry checks remain required.
+            // chevron becomes part of the line. OCR proposes text only;
+            // fresh label uniqueness and geometry checks remain required.
             guard observation.confidence.isFinite, observation.confidence >= 0.3, observation.confidence <= 1,
                   validNormalizedBox(observation.visionBox) else { return nil }
             let text = observation.text.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ")
@@ -164,8 +174,8 @@ final class VisualControlObserver {
         // Check every recognized label before applying the candidate cap. A
         // duplicate below the first 60 rows must not make an earlier one appear
         // unique merely because the duplicate was truncated.
-        let counts = Dictionary(grouping: usable, by: { $0.0 }).mapValues(\.count)
-        return usable.filter { counts[$0.0] == 1 }.prefix(60).enumerated().map {
+        let counts = Dictionary(grouping: usable, by: { labelIdentity($0.0) }).mapValues(\.count)
+        return usable.filter { counts[labelIdentity($0.0)] == 1 }.prefix(60).enumerated().map {
             Candidate(id: "visual_\($0.offset + 1)", text: $0.element.0, normalizedBox: $0.element.1)
         }
     }
@@ -186,8 +196,8 @@ final class VisualControlObserver {
         guard previous.processID == current.processID, previous.windowID == current.windowID,
               previous.bounds == current.bounds, validBounds(current.bounds),
               previous.candidates.contains(selected),
-              previous.candidates.filter({ $0.text == selected.text }).count == 1 else { return nil }
-        let matches = current.candidates.filter { $0.text == selected.text }
+              previous.candidates.filter({ labelIdentity($0.text) == labelIdentity(selected.text) }).count == 1 else { return nil }
+        let matches = current.candidates.filter { labelIdentity($0.text) == labelIdentity(selected.text) }
         guard matches.count == 1, let fresh = matches.first,
               screenPoint(for: selected, in: previous) != nil, screenPoint(for: fresh, in: current) != nil else { return nil }
         let a = selected.normalizedBox, b = fresh.normalizedBox
@@ -196,6 +206,30 @@ final class VisualControlObserver {
               abs(a.minY - b.minY) * current.bounds.height <= 8,
               abs(a.maxY - b.maxY) * current.bounds.height <= 8 else { return nil }
         return fresh
+    }
+
+    /// Ignore only known dropdown-chevron OCR suffixes. Keep meaningful
+    /// punctuation, digits, and internal characters; this is not fuzzy matching.
+    /// Duplicate labels use the same identity, so normalization never turns two
+    /// visible choices into a unique target.
+    nonisolated static func labelIdentity(_ text: String) -> String {
+        String(text[labelContentRange(in: text)])
+    }
+
+    nonisolated static func labelContentRange(in text: String) -> Range<String.Index> {
+        var start = text.startIndex, end = text.endIndex
+        while start < end, text[start].isWhitespace { start = text.index(after: start) }
+        while start < end, text[text.index(before: end)].isWhitespace { end = text.index(before: end) }
+        let trimmedEnd = end
+        let chevrons: Set<Character> = ["丶", "~", "～", "⌄", "⌃", "﹀", "∨", "⌵", "▾", "▿", "▼", "˅"]
+        while start < end {
+            let last = text.index(before: end)
+            guard chevrons.contains(text[last]) || text[last].isWhitespace else { break }
+            end = last
+        }
+        // Do not normalize symbols or numeric fields such as 1~ into a target.
+        let letters = text[start..<end].unicodeScalars.filter { CharacterSet.letters.contains($0) }.count
+        return start..<(letters >= 2 ? end : trimmedEnd)
     }
 
     nonisolated private static func validNormalizedBox(_ box: CGRect) -> Bool {

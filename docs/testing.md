@@ -46,15 +46,15 @@ After granting Accessibility to the installed VoiceCodex build, run these scenar
 | Insert quoted Chinese, emoji, and multiple lines | Exact text; surrounding content preserved; no Return |
 | Replace selected text in the QA editor | Only that selection changes |
 | Type quoted text containing “open Chrome” or “close all windows” | Only literal text is inserted; no app opens or closes |
-| Copy selected QA text, confirm paste into another QA field | Matching text appears in the selected field |
+| Copy selected QA text, paste into another QA field | Matching text appears in the selected field |
 | Undo a native edit | Previous editor state restored |
-| Confirm Return in the multiline editor | A line break appears |
-| Click “Increment counter” and confirm | Counter increments exactly once |
+| Press Return in the multiline editor | A line break appears |
+| Click “Increment counter” | Counter increments exactly once |
 | Scroll a long QA document down/up | Editor scroll position visibly changes |
 | Close one QA window | Other QA windows remain |
-| Confirm closing all QA windows | All observed disposable windows close |
-| Cancel the in-app review | Target remains unchanged |
-| Change target window/field during review | Action stops with a changed-target message |
+| Close all QA windows | All observed disposable windows close |
+| Stop with Esc while planning | Target remains unchanged; pending steps clear |
+| Change target window/field while planning | Action stops before input |
 | Missing Accessibility permission | Action stops and offers the permission settings |
 | Stop during an in-flight request | No later action executes; app accepts the next command |
 
@@ -100,7 +100,7 @@ Run `swift test` for sequence parsing, ordered planning, target carry, queued ar
 
 The endpoint check sends two fixed synthetic phrases with silence between them to Soniox, without microphone capture or desktop input. It requires the first utterance callback before EOF, exactly two ordered segments, one full final transcript, and no replay on a repeated finish. Results stay in ignored `.build/qa/`.
 
-Desktop acceptance: type `打开计算器，然后打开日历` and verify two ordered receipts plus the final target window. For Tencent Meeting, verify `打开腾讯会议，然后创建一个新的会议` selects the currently observed Quick Meeting label for review. AX-only builds cannot operate its custom-drawn home buttons; the local OCR fallback requires user-granted Screen Recording access. Do not treat planner/fixture success as actual meeting creation. Decline the review when a test should not start a real meeting.
+Desktop acceptance: type `打开计算器，然后打开日历` and verify two ordered receipts plus the final target window. All Jev steps execute without an in-app confirmation. For Tencent Meeting, test `在腾讯会议点击预定会议` to open its scheduling form without submitting it. The Quick Meeting command can start a real meeting immediately; use its planner/observed-label fixtures when meeting creation is outside the test scope. AX-only builds cannot operate its custom-drawn home buttons; the local OCR fallback requires user-granted Screen Recording access. Do not treat planner/fixture success as actual meeting creation.
 
 For microphone acceptance, enable **边说边做**, hold the shortcut and say an app-open command, pause until it executes while still holding, then say another and release. Confirm that each runs once. Esc during planning must prevent later actions. Disable the checkbox to check release-only behavior; coding mode must continue to submit one complete prompt.
 
@@ -122,3 +122,13 @@ swiftc Sources/VoiceCodexCore/EnvironmentFile.swift \
 The explicit `--live` flag authorizes real TypeSafe requests using the existing local application-support `.env`. The harness sends fixed public app descriptors, synthetic commands, and synthetic observed labels; it reads no windows, captures no audio or screenshots, and performs no desktop input. Seven sequence cases cover the full Tencent Meeting request in Chinese/English, Chrome then a new tab, quoted text then Return, and a leading streaming continuation. Six control fixtures distinguish immediate new meetings from joining, scheduling, and sharing, including `AXButton` and `屏幕文字` label formats and an absent-target case.
 
 Each step must return the exact expected intent, application, and literal text. The next planner call receives the preceding planned app target; this simulates target carry and does not verify app activation. Control fixtures check selection only, including the Quick Meeting wording observed in Tencent Meeting. They do not prove that a button was clicked or a meeting was created. The report retains numeric model confidence, pass/fail, and latency for every case, and saves after each completed case. Use `--filter case-id` for a bounded recheck and a different `--output` filename to preserve earlier failures. The production 0.75 confidence threshold stays unchanged.
+
+## Direct execution validation — 2026-09-24
+
+- Jev actions no longer create a VoiceCodex confirmation sheet. Automatic foreground/window/control checks and Esc cancellation remain. The signing identity and installed bundle path remain stable; the upgraded app visibly retained Accessibility and Screen Recording grants.
+- The installed app executed `在腾讯会议点击「预定会议」` through local OCR and opened the actual scheduling form. No VoiceCodex confirmation appeared. The form was closed without submission; no meeting was created.
+- Two sequential `Increment counter` commands changed the disposable native target counter from 0 to 2 exactly. A three-step literal input → Return → literal input sequence produced the two expected Chinese lines, and Return → paste appended the known two-line fixture. Each operation ran directly through the production Jev command UI.
+- Initial close-all probes exposed transient unreadable AX window state after input. Bounded read-only observation now verifies newly created QA windows. The latest close-all probe still stopped after one observed close because the remaining QA window did not expose a readable close control; this case is a known limitation, not a passed scenario. Failed receipts remain in private local history.
+- Local screenshots and detailed execution history remain under ignored QA output or private app support, not in Git. Microphone hardware and real meeting creation are outside these desktop checks.
+
+A cold-start Tencent open → Schedule click probe initially returned no match; a subsequent settled-window click succeeded. The driver now allows one fresh observation after an explicit no-match and only reselects when visible candidates genuinely change in the same window. Six regression cases cover changed versus unchanged evidence, alternate errors, cancellation, and the one-retry bound. No low-confidence or native action retries were added.

@@ -5,12 +5,15 @@ import VoiceCodexCore
 enum MacControlError: LocalizedError {
     case noTarget, unavailableApplication, applicationNotRunning, accessibilityRequired, focusChanged
     case unsupported, noEditableField, protectedField, terminalInput, staleElement
-    case noControls, noWindow, blockedByDialog, actionFailed, confirmationChanged
-    case incomplete(String)
+    case noControls, noWindow, blockedByDialog, actionFailed
+    case incomplete(String), visualTargetChanged(String)
+    case windowStateUnreadable(Int32)
 
     var errorDescription: String? {
         switch self {
         case .incomplete(let receipt): return receipt
+        case .visualTargetChanged(let reason): return "点击前重新检查未通过（\(reason)），这次操作已停止。"
+        case .windowStateUnreadable(let code): return "无法读取目标 App 的窗口状态（AXWindows 错误 \(code)）。"
         case .noTarget: return "请先切换到要控制的 App，再按住语音快捷键。"
         case .unavailableApplication: return "找不到这次指令指定的 App。"
         case .applicationNotRunning: return "目标 App 尚未运行，请先打开它再执行这个操作。"
@@ -25,7 +28,6 @@ enum MacControlError: LocalizedError {
         case .noWindow: return "目标 App 没有可操作的窗口。"
         case .blockedByDialog: return "目标 App 有待处理的对话框，请先处理后再继续。"
         case .actionFailed: return "系统没有接受这次操作；没有自动重试。"
-        case .confirmationChanged: return "确认期间目标窗口或输入框发生了变化，这次操作已停止。"
         }
     }
 }
@@ -139,22 +141,6 @@ final class MacControlDriver {
         intent != .openApp && intent != .unsupported
     }
 
-    func requiresConfirmation(_ command: MacCommand) -> Bool {
-        switch command.intent {
-        case .closeAllWindows, .pressReturn, .paste, .clickElement: return true
-        default: return false
-        }
-    }
-
-    struct ConfirmationContext {
-        fileprivate let applicationID: String
-        fileprivate let processID: pid_t
-        fileprivate let intent: MacIntent
-        fileprivate let window: AXUIElement
-        fileprivate let field: AXUIElement?
-        fileprivate let windows: [AXUIElement]?
-    }
-
     /// App launch may finish before its first window is exposed to Accessibility.
     /// Retry only observation, never the action itself.
     func waitForInterface(command: MacCommand) async throws {
@@ -171,52 +157,7 @@ final class MacControlDriver {
         throw MacControlError.noWindow
     }
 
-    /// Snapshot the selected app before VoiceCodex shows its confirmation sheet.
-    /// No app activation or text values are needed for this identity check.
-    func captureConfirmationContext(command: MacCommand) async throws -> ConfirmationContext {
-        try Task.checkCancellation()
-        guard accessibilityGranted else { throw MacControlError.accessibilityRequired }
-        guard let id = command.applicationID ?? foregroundApplicationID else { throw MacControlError.noTarget }
-        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: id).first(where: { !$0.isTerminated }) else {
-            throw MacControlError.applicationNotRunning
-        }
-        let ax = applicationElement(app)
-        guard let window = elementAttribute(ax, kAXFocusedWindowAttribute) else { throw MacControlError.noWindow }
-        let field: AXUIElement?
-        if [.paste, .pressReturn].contains(command.intent) {
-            field = try await validateInputContext(app: app, ax: ax, requireEditable: command.intent == .paste)
-        } else { field = nil }
-        let windows = command.intent == .closeAllWindows ? try windowSnapshot(ax) : nil
-        try Task.checkCancellation()
-        return ConfirmationContext(applicationID: id, processID: app.processIdentifier, intent: command.intent,
-                                   window: window, field: field, windows: windows)
-    }
-
-    private func verifyConfirmationContext(_ context: ConfirmationContext, command: MacCommand,
-                                           app: NSRunningApplication, ax: AXUIElement) throws {
-        try Task.checkCancellation()
-        guard context.applicationID == app.bundleIdentifier, context.processID == app.processIdentifier,
-              context.intent == command.intent,
-              let currentWindow = elementAttribute(ax, kAXFocusedWindowAttribute), CFEqual(currentWindow, context.window) else {
-            throw MacControlError.confirmationChanged
-        }
-        if let field = context.field {
-            guard let currentField = elementAttribute(ax, kAXFocusedUIElementAttribute), CFEqual(currentField, field) else {
-                throw MacControlError.confirmationChanged
-            }
-        }
-        if let windows = context.windows, !sameWindows(try windowSnapshot(ax), windows) {
-            throw MacControlError.confirmationChanged
-        }
-    }
-
-    private func sameWindows(_ left: [AXUIElement], _ right: [AXUIElement]) -> Bool {
-        left.count == right.count && left.allSatisfy { candidate in right.contains { CFEqual(candidate, $0) } }
-    }
-
-    func execute(command: MacCommand, goal: String = "", jev: JevClient,
-                 context: ConfirmationContext? = nil,
-                 confirmClick: ((String) async -> Bool)? = nil) async throws -> String {
+    func execute(command: MacCommand, goal: String = "", jev: JevClient) async throws -> String {
         try Task.checkCancellation()
         guard command.intent != .unsupported else { throw MacControlError.unsupported }
         guard let id = command.applicationID ?? foregroundApplicationID else { throw MacControlError.noTarget }
@@ -245,7 +186,6 @@ final class MacControlDriver {
         guard let app = application else { throw MacControlError.applicationNotRunning }
         try await focus(app)
         let ax = applicationElement(app)
-        if let context { try verifyConfirmationContext(context, command: command, app: app, ax: ax) }
         let name = app.localizedName ?? id
         switch command.intent {
         case .newTab:
@@ -267,22 +207,28 @@ final class MacControlDriver {
             }
             return "已向 \(name) 发送关闭当前标签页快捷键（⌘W）；关闭结果尚未验证。"
         case .newWindow:
-            guard !hasBlockingDialog(ax) else { throw MacControlError.blockedByDialog }
-            let before = try? windowSnapshot(ax)
+            let initial = try await Self.observeWindowTransition(read: { try readUnblockedWindowSnapshot(ax) }, until: { _ in true })
+            let before = initial.windows
             if launchedForCreation, let before, !before.isEmpty {
                 return "已启动 \(name)，并观察到它打开了窗口。"
             }
             try await shortcut(45, flags: .maskCommand, app: app) { [self] in
                 guard !hasBlockingDialog(ax) else { throw MacControlError.blockedByDialog }
             }
-            try await Task.sleep(nanoseconds: 180_000_000)
-            if let before, let after = try? windowSnapshot(ax),
-               after.contains(where: { candidate in !before.contains(where: { CFEqual(candidate, $0) }) }) {
-                return "已观察到 \(name) 新建了窗口。"
+            var readError = initial.readError
+            if let before {
+                let observation = try await Self.observeWindowTransition(read: { try readUnblockedWindowSnapshot(ax) }) { after in
+                    after.contains { candidate in !before.contains { CFEqual(candidate, $0) } }
+                }
+                if observation.completed {
+                    return "已观察到 \(name) 新建了窗口。"
+                }
+                readError = observation.readError
             }
-            return "已向 \(name) 发送新建快捷键（⌘N）；由该 App 决定新建窗口、文稿或便笺。"
+            let detail = readError.map { " \($0.localizedDescription)" } ?? ""
+            return "已向 \(name) 发送新建快捷键（⌘N）；由该 App 决定新建窗口、文稿或便笺。\(detail)"
         case .closeWindow: return try await closeWindows(app: app, all: false)
-        case .closeAllWindows: return try await closeWindows(app: app, all: true, expectedWindows: context?.windows)
+        case .closeAllWindows: return try await closeWindows(app: app, all: true)
         case .typeText:
             guard let text = command.text, !text.isEmpty else { throw MacControlError.noEditableField }
             let observed = try await insertLiteralText(text, app: app, ax: ax)
@@ -291,7 +237,6 @@ final class MacControlDriver {
         case .pressReturn:
             let field = try await validateInputContext(app: app, ax: ax, requireEditable: false)
             try await shortcut(36, flags: [], app: app) { [self] in
-                if let context { try verifyConfirmationContext(context, command: command, app: app, ax: ax) }
                 try verifyFocusedElement(field, app: app, ax: ax)
                 try rejectProtectedField(field)
             }
@@ -304,7 +249,6 @@ final class MacControlDriver {
         case .paste:
             let field = try await validateInputContext(app: app, ax: ax, requireEditable: true)
             try await shortcut(9, flags: .maskCommand, app: app) { [self] in
-                if let context { try verifyConfirmationContext(context, command: command, app: app, ax: ax) }
                 try verifyFocusedElement(field, app: app, ax: ax)
                 try rejectProtectedField(field)
             }
@@ -329,7 +273,7 @@ final class MacControlDriver {
             }
             return "已向 \(name) 当前窗口发送滚动；滚动位置尚未验证。"
         case .clickElement:
-            return try await click(goal: goal.isEmpty ? (command.text ?? "") : goal, app: app, jev: jev, confirm: confirmClick)
+            return try await click(goal: goal.isEmpty ? (command.text ?? "") : goal, app: app, jev: jev)
         case .openApp, .unsupported: throw MacControlError.unsupported
         }
     }
@@ -486,52 +430,156 @@ final class MacControlDriver {
         }
     }
 
-    private func closeWindows(app: NSRunningApplication, all: Bool, expectedWindows: [AXUIElement]? = nil) async throws -> String {
+    private func closeWindows(app: NSRunningApplication, all: Bool) async throws -> String {
         let ax = applicationElement(app)
-        guard !hasBlockingDialog(ax) else { throw MacControlError.blockedByDialog }
+        let initial = try await Self.observeWindowTransition(read: { () throws -> [AXUIElement]? in
+            if all { return try readUnblockedWindowSnapshot(ax) }
+            // Closing one focused window does not require the app to expose an
+            // AXWindows array. Keep that action available, with an honest
+            // unverified receipt if the post-action list remains unreadable.
+            if let focused = elementAttribute(ax, kAXFocusedWindowAttribute) {
+                guard !hasBlockingDialog(in: focused) else { throw MacControlError.blockedByDialog }
+                return [focused]
+            }
+            return try windowSnapshot(ax).isEmpty ? [] : nil
+        }, until: { _ in true })
+        guard let snapshot = initial.windows else { throw initial.readError ?? MacControlError.actionFailed }
         let windows: [AXUIElement]
         var limited = false
         if all {
-            let snapshot = try windowSnapshot(ax)
-            if let expectedWindows, !sameWindows(snapshot, expectedWindows) { throw MacControlError.confirmationChanged }
             limited = snapshot.count > 24
             windows = Array(snapshot.prefix(24))
         }
-        else if let window = elementAttribute(ax, kAXFocusedWindowAttribute) { windows = [window] }
-        else { windows = [] }
+        else { windows = snapshot }
         guard !windows.isEmpty else { throw MacControlError.noWindow }
         var observedClosed = 0
         for window in windows {
-            guard let close = elementAttribute(window, kAXCloseButtonAttribute), boolAttribute(close, kAXEnabledAttribute) != false else {
+            // Closing a window can briefly hide the next window's AX close
+            // button. Refresh its handle by identity and retry reads only;
+            // never substitute another window or repeat an accepted press.
+            let readiness = try await Self.observeWindowTransition(read: { () throws -> [ObservedWindowClose]? in
+                let current: AXUIElement
+                if all {
+                    guard let remaining = try readUnblockedWindowSnapshot(ax) else { return nil }
+                    guard let matching = remaining.first(where: { CFEqual($0, window) }) else {
+                        throw MacControlError.staleElement
+                    }
+                    current = matching
+                } else {
+                    guard let focused = elementAttribute(ax, kAXFocusedWindowAttribute) else { return nil }
+                    guard CFEqual(focused, window) else { throw MacControlError.focusChanged }
+                    guard !hasBlockingDialog(in: focused) else { throw MacControlError.blockedByDialog }
+                    current = focused
+                }
+                guard let close = elementAttribute(current, kAXCloseButtonAttribute),
+                      boolAttribute(close, kAXEnabledAttribute) != false else { return nil }
+                return [ObservedWindowClose(window: current, button: close)]
+            }, until: { !$0.isEmpty })
+            guard let target = readiness.windows?.first else {
+                if let error = readiness.readError {
+                    throw MacControlError.incomplete("已观察到 \(observedClosed) 个窗口关闭；\(error.localizedDescription)已停止。")
+                }
                 throw MacControlError.incomplete("已观察到 \(observedClosed) 个窗口关闭；遇到无法关闭的窗口，已停止。")
             }
             let delivered = try await Self.withNativeActionCheckpoint {
                 guard !hasBlockingDialog(ax) else { throw MacControlError.blockedByDialog }
-                guard let currentClose = elementAttribute(window, kAXCloseButtonAttribute), CFEqual(currentClose, close),
-                      boolAttribute(close, kAXEnabledAttribute) != false else { throw MacControlError.staleElement }
+                if all {
+                    guard try windowSnapshot(ax).contains(where: { CFEqual($0, target.window) }) else { throw MacControlError.staleElement }
+                } else {
+                    guard let focused = elementAttribute(ax, kAXFocusedWindowAttribute), CFEqual(focused, target.window) else {
+                        throw MacControlError.focusChanged
+                    }
+                }
+                guard let currentClose = elementAttribute(target.window, kAXCloseButtonAttribute), CFEqual(currentClose, target.button),
+                      boolAttribute(target.button, kAXEnabledAttribute) != false else { throw MacControlError.staleElement }
                 try verifyFocus(app)
-                return AXUIElementPerformAction(close, kAXPressAction as CFString)
+                return AXUIElementPerformAction(target.button, kAXPressAction as CFString)
             }
             guard delivered == .success else {
                 if observedClosed == 0 { throw MacControlError.actionFailed }
                 throw MacControlError.incomplete("已观察到 \(observedClosed) 个窗口关闭；后续关闭请求未被接受，已停止。")
             }
-            try await Task.sleep(nanoseconds: 180_000_000)
-            guard let remaining = try? windowSnapshot(ax) else {
-                throw MacControlError.incomplete("已观察到 \(observedClosed) 个窗口关闭；最新窗口状态无法读取，已停止。")
+            let observation: WindowObservation<AXUIElement>
+            do {
+                observation = try await Self.observeWindowTransition(read: { try readUnblockedWindowSnapshot(ax) }) { remaining in
+                    !remaining.contains { CFEqual($0, window) }
+                }
+            } catch MacControlError.blockedByDialog {
+                throw MacControlError.incomplete("已观察到 \(observedClosed) 个窗口关闭；目标 App 出现待处理的对话框，已停止。")
             }
-            let disappeared = !remaining.contains { CFEqual($0, window) }
-            if disappeared { observedClosed += 1 }
-            if !disappeared || hasBlockingDialog(ax) {
+            guard observation.windows != nil else {
+                let detail = observation.readError?.localizedDescription ?? "最新窗口状态无法读取。"
+                throw MacControlError.incomplete("已观察到 \(observedClosed) 个窗口关闭；\(detail)已停止。")
+            }
+            if !observation.completed {
                 throw MacControlError.incomplete("已观察到 \(observedClosed) 个窗口关闭；其余关闭结果未确认，可能正在等待保存对话框，已停止。")
             }
+            observedClosed += 1
         }
         if limited { throw MacControlError.incomplete("已观察到 \(observedClosed) 个窗口关闭。本次最多关闭 24 个，仍有其他窗口未处理，后续步骤已停止。") }
         return "已观察到 \(observedClosed) 个窗口关闭。"
     }
 
+    private struct ObservedWindowClose {
+        let window: AXUIElement
+        let button: AXUIElement
+    }
+
+    struct WindowObservation<Window> {
+        let windows: [Window]?
+        let completed: Bool
+        let readError: MacControlError?
+    }
+
+    /// Accessibility can lag after a delivered key or AXPress. Retry only
+    /// observations, with a fixed attempt budget; this helper cannot send input.
+    /// An unchanged readable list is not success, and a failed read is not an
+    /// empty list. Keep the last read so timeouts report the current uncertainty.
+    static func observeWindowTransition<Window>(
+        attempts: Int = 16,
+        read: () throws -> [Window]?,
+        until isComplete: ([Window]) -> Bool,
+        wait: () async throws -> Void = { try await Task.sleep(nanoseconds: 150_000_000) }
+    ) async throws -> WindowObservation<Window> {
+        try Task.checkCancellation()
+        var latest: [Window]?
+        var readError: MacControlError?
+        for attempt in 0..<max(0, attempts) {
+            try Task.checkCancellation()
+            if attempt > 0 { try await wait() }
+            try Task.checkCancellation()
+            do {
+                latest = try read()
+                readError = nil
+            } catch MacControlError.windowStateUnreadable(let code) {
+                latest = nil
+                readError = .windowStateUnreadable(code)
+            }
+            try Task.checkCancellation()
+            if let latest, isComplete(latest) {
+                return WindowObservation(windows: latest, completed: true, readError: nil)
+            }
+        }
+        return WindowObservation(windows: latest, completed: false, readError: readError)
+    }
+
+    /// A temporarily missing focused window during an animation is unreadable,
+    /// not a dialog. Actual modal windows still stop observation immediately.
+    private func readUnblockedWindowSnapshot(_ app: AXUIElement) throws -> [AXUIElement]? {
+        let windows = try windowSnapshot(app)
+        if let focused = elementAttribute(app, kAXFocusedWindowAttribute) {
+            guard !hasBlockingDialog(in: focused) else { throw MacControlError.blockedByDialog }
+        } else if !windows.isEmpty {
+            return nil
+        }
+        return windows
+    }
+
     private func windowSnapshot(_ app: AXUIElement) throws -> [AXUIElement] {
-        guard let raw = attribute(app, kAXWindowsAttribute), let values = raw as? [CFTypeRef] else {
+        var raw: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &raw)
+        guard result == .success else { throw MacControlError.windowStateUnreadable(result.rawValue) }
+        guard let raw, let values = raw as? [CFTypeRef] else {
             throw MacControlError.actionFailed
         }
         return values.filter { CFGetTypeID($0) == AXUIElementGetTypeID() }.map { unsafeBitCast($0, to: AXUIElement.self) }
@@ -542,8 +590,7 @@ final class MacControlDriver {
         let label: String
     }
 
-    private func click(goal: String, app: NSRunningApplication, jev: JevClient,
-                       confirm: ((String) async -> Bool)?) async throws -> String {
+    private func click(goal: String, app: NSRunningApplication, jev: JevClient) async throws -> String {
         let ax = applicationElement(app)
         guard let window = elementAttribute(ax, kAXFocusedWindowAttribute) else { throw MacControlError.noWindow }
         var controls: [String: ObservedControl] = [:]
@@ -561,7 +608,7 @@ final class MacControlDriver {
             if controls.count == 60 { break }
         }
         guard !controls.isEmpty else {
-            return try await clickVisual(goal: goal, app: app, window: window, jev: jev, confirm: confirm)
+            return try await clickVisual(goal: goal, app: app, window: window, jev: jev)
         }
         let selected: String
         do {
@@ -571,12 +618,11 @@ final class MacControlDriver {
             // drawing the requested control themselves. An explicit no-match
             // may use a fresh visual observation; uncertain/failed choices may not.
             try Task.checkCancellation()
-            return try await clickVisual(goal: goal, app: app, window: window, jev: jev, confirm: confirm)
+            return try await clickVisual(goal: goal, app: app, window: window, jev: jev)
         }
         try Task.checkCancellation()
         guard let control = controls[selected] else { throw MacControlError.staleElement }
-        guard let confirm, await confirm(control.label) else { throw CancellationError() }
-        try await focus(app)
+        try verifyFocus(app)
         guard let current = elementAttribute(ax, kAXFocusedWindowAttribute), CFEqual(current, window),
               boundedDescendants(current).contains(where: { CFEqual($0, control.element) }),
               controlLabel(control.element) == control.label,
@@ -596,51 +642,145 @@ final class MacControlDriver {
         return "已向 \(app.localizedName ?? "目标 App") 的控件发送点击；点击后的任务结果尚未验证。"
     }
 
-    private func clickVisual(goal: String, app: NSRunningApplication, window: AXUIElement, jev: JevClient,
-                             confirm: ((String) async -> Bool)?) async throws -> String {
+    private func clickVisual(goal: String, app: NSRunningApplication, window: AXUIElement, jev: JevClient) async throws -> String {
         try verifyFocus(app)
         let ax = applicationElement(app)
         guard !hasBlockingDialog(ax) else { throw MacControlError.blockedByDialog }
         guard let focusedWindow = elementAttribute(ax, kAXFocusedWindowAttribute), CFEqual(focusedWindow, window) else {
-            throw MacControlError.staleElement
+            throw MacControlError.visualTargetChanged("目标窗口已切换")
         }
         guard let bounds = frame(of: window) else { throw MacControlError.noWindow }
         let observer = VisualControlObserver()
-        let snapshot = try await observer.observe(processID: app.processIdentifier, expectedWindowFrame: bounds)
-        try Task.checkCancellation()
-        let labels = Dictionary(uniqueKeysWithValues: snapshot.candidates.map { ($0.id, "屏幕文字 · " + $0.text) })
-        guard !labels.isEmpty else { throw MacControlError.noControls }
-        let selected = try await jev.chooseElement(goal: goal, elements: labels)
-        try Task.checkCancellation()
-        guard let candidate = snapshot.candidates.first(where: { $0.id == selected }) else { throw MacControlError.staleElement }
-        guard let confirm, await confirm("屏幕文字「\(candidate.text)」（本机识别）") else { throw CancellationError() }
-        try await focus(app)
+        let initial = try await observer.observe(processID: app.processIdentifier, expectedWindowFrame: bounds)
+        let (snapshot, selected) = try await Self.chooseVisualTarget(from: initial,
+            observe: { try await observer.observe(processID: app.processIdentifier, expectedWindowFrame: bounds) },
+            validate: {
+                try self.verifyFocus(app)
+                guard !self.hasBlockingDialog(ax) else { throw MacControlError.blockedByDialog }
+                guard let current = self.elementAttribute(ax, kAXFocusedWindowAttribute), CFEqual(current, window),
+                      self.frame(of: current) == bounds else { throw MacControlError.visualTargetChanged("窗口或位置已变化") }
+            }, choose: { observation in
+                let labels = Dictionary(uniqueKeysWithValues: observation.candidates.map { ($0.id, "屏幕文字 · " + $0.text) })
+                guard !labels.isEmpty else { throw MacControlError.noControls }
+                return try await jev.chooseElement(goal: goal, elements: labels)
+            })
+        guard let candidate = snapshot.candidates.first(where: { $0.id == selected }) else {
+            throw MacControlError.visualTargetChanged("未找到所选文字")
+        }
+        try verifyFocus(app)
         guard let currentWindow = elementAttribute(ax, kAXFocusedWindowAttribute), CFEqual(currentWindow, window),
-              frame(of: currentWindow) == bounds else { throw MacControlError.staleElement }
+              frame(of: currentWindow) == bounds else { throw MacControlError.visualTargetChanged("窗口或位置已变化") }
         let fresh = try await observer.observe(processID: app.processIdentifier, expectedWindowFrame: bounds)
         guard let current = VisualControlObserver.revalidatedCandidate(candidate, from: snapshot, in: fresh),
-              let point = VisualControlObserver.screenPoint(for: current, in: fresh),
-              let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left),
+              let point = VisualControlObserver.screenPoint(for: current, in: fresh) else {
+            throw MacControlError.visualTargetChanged("按钮文字或位置未能匹配")
+        }
+        guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left),
               let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left) else {
-            throw MacControlError.staleElement
+            throw MacControlError.actionFailed
         }
         try await Self.withNativeActionCheckpoint {
             try verifyFocus(app)
             guard !hasBlockingDialog(ax) else { throw MacControlError.blockedByDialog }
             guard let finalWindow = elementAttribute(ax, kAXFocusedWindowAttribute), CFEqual(finalWindow, window),
-                  frame(of: finalWindow) == bounds else { throw MacControlError.staleElement }
-            // Confirm the point is still owned by the same target process/window.
+                  frame(of: finalWindow) == bounds else { throw MacControlError.visualTargetChanged("点击前窗口已变化") }
+            // Validate the point against its actual process and window.
             var hit: AXUIElement?
             guard AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(point.x), Float(point.y), &hit) == .success,
-                  let hit else { throw MacControlError.staleElement }
+                  let hit else { throw MacControlError.visualTargetChanged("无法读取点击位置的控件") }
             var hitPID: pid_t = 0
             guard AXUIElementGetPid(hit, &hitPID) == .success, hitPID == app.processIdentifier else { throw MacControlError.focusChanged }
-            let hitWindow = stringAttribute(hit, kAXRoleAttribute) == kAXWindowRole ? hit : elementAttribute(hit, kAXWindowAttribute)
-            guard let hitWindow, CFEqual(hitWindow, window) else { throw MacControlError.staleElement }
+            if let hitWindow = containingWindow(of: hit) {
+                guard CFEqual(hitWindow, window) else { throw MacControlError.visualTargetChanged("点击位置属于另一个窗口") }
+            } else {
+                // Custom-drawn Qt controls may resolve only to AXApplication.
+                // Use the window server's front-to-back list to prove that the
+                // very same captured window owns the click, rather than treating
+                // absent AXWindow metadata as a changed interface.
+                guard Self.frontmostWindow(at: point, in: onScreenHitWindows()).map({
+                    $0.processID == app.processIdentifier && $0.windowID == fresh.windowID
+                }) == true else { throw MacControlError.visualTargetChanged("无法确认点击位置所属窗口") }
+            }
             down.post(tap: .cghidEventTap)
             up.post(tap: .cghidEventTap)
         }
         return "已点击 \(app.localizedName ?? "目标 App") 的屏幕文字「\(candidate.text)」；后续任务结果尚未验证。"
+    }
+
+    /// A just-opened app can replace its loading view while Jev is choosing.
+    /// Replan once only after an explicit no-match and genuinely changed visual
+    /// evidence in the identical window. No input is sent by this helper.
+    static func chooseVisualTarget(
+        from initial: VisualControlObserver.Snapshot,
+        observe: () async throws -> VisualControlObserver.Snapshot,
+        validate: () throws -> Void,
+        choose: (VisualControlObserver.Snapshot) async throws -> String
+    ) async throws -> (VisualControlObserver.Snapshot, String) {
+        try Task.checkCancellation()
+        try validate()
+        let selected: String
+        do {
+            selected = try await choose(initial)
+        } catch JevClientError.unsupportedCommand {
+            try Task.checkCancellation()
+            try validate()
+            let refreshed = try await observe()
+            try Task.checkCancellation()
+            try validate()
+            guard refreshed.processID == initial.processID, refreshed.windowID == initial.windowID,
+                  refreshed.bounds == initial.bounds else { throw MacControlError.visualTargetChanged("目标窗口已切换") }
+            let changed = refreshed.candidates.count != initial.candidates.count || initial.candidates.contains {
+                VisualControlObserver.revalidatedCandidate($0, from: initial, in: refreshed) == nil
+            }
+            guard changed else { throw JevClientError.unsupportedCommand }
+            let retry = try await choose(refreshed)
+            try Task.checkCancellation()
+            try validate()
+            return (refreshed, retry)
+        }
+        try Task.checkCancellation()
+        try validate()
+        return (initial, selected)
+    }
+
+    private func containingWindow(of element: AXUIElement) -> AXUIElement? {
+        var current: AXUIElement? = element
+        for _ in 0..<8 {
+            guard let item = current else { return nil }
+            if stringAttribute(item, kAXRoleAttribute) == kAXWindowRole { return item }
+            if let window = elementAttribute(item, kAXWindowAttribute) { return window }
+            current = elementAttribute(item, kAXParentAttribute)
+        }
+        return nil
+    }
+
+    struct HitWindow {
+        let processID: pid_t
+        let windowID: CGWindowID
+        let bounds: CGRect
+        let alpha: Double
+    }
+
+    private func onScreenHitWindows() -> [HitWindow] {
+        guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+                as? [[String: Any]] else { return [] }
+        return windows.compactMap { info in
+            guard let processID = info[kCGWindowOwnerPID as String] as? NSNumber,
+                  let windowID = info[kCGWindowNumber as String] as? NSNumber,
+                  let rawBounds = info[kCGWindowBounds as String] as? NSDictionary,
+                  let bounds = CGRect(dictionaryRepresentation: rawBounds) else { return nil }
+            return HitWindow(processID: processID.int32Value, windowID: windowID.uint32Value, bounds: bounds,
+                             alpha: (info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1)
+        }
+    }
+
+    /// CGWindowListCopyWindowInfo supplies front-to-back order. Never search
+    /// past an opaque overlay for a preferred process or window.
+    nonisolated static func frontmostWindow(at point: CGPoint, in windows: [HitWindow]) -> HitWindow? {
+        guard point.x.isFinite, point.y.isFinite else { return nil }
+        return windows.first {
+            $0.alpha.isFinite && $0.alpha > 0 && $0.bounds.contains(point)
+        }
     }
 
     private func boundedDescendants(_ root: AXUIElement) -> [AXUIElement] {
@@ -680,6 +820,10 @@ final class MacControlDriver {
             // focused window is uncertain, not proof that no dialog exists.
             return (try? windowSnapshot(app).isEmpty) != true
         }
+        return hasBlockingDialog(in: focused)
+    }
+
+    private func hasBlockingDialog(in focused: AXUIElement) -> Bool {
         if boolAttribute(focused, kAXModalAttribute) == true || stringAttribute(focused, kAXRoleAttribute) == kAXSheetRole { return true }
         let deadline = Date().addingTimeInterval(1)
         for child in elementsAttribute(focused, kAXChildrenAttribute).prefix(30) {

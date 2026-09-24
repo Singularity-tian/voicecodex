@@ -36,10 +36,10 @@ final class VisualControlObserverTests: XCTestCase {
         XCTAssertEqual(Observer.candidates(from: observations, bounds: bounds).map(\.text), ["included"])
     }
 
-    func testReadableMeetingLabelsWithChevronRemainExactConfirmationCandidates() throws {
+    func testMeetingChevronNoiseRevalidatesTheSameLabelAndGeometry() throws {
         // Local Vision recognized these public UI labels at 0.3 with language
-        // correction both enabled and disabled. Keep the recognized suffix so
-        // selection, confirmation, and reobservation compare the same text.
+        // correction both enabled and disabled. Preserve raw labels for routing,
+        // but ignore only the decorative suffix when revalidating identity.
         let observations: [Observer.TextObservation] = [
             .init(text: "快速会议丶", confidence: 0.3, visionBox: CGRect(x: 0.3, y: 0.67, width: 0.1, height: 0.04)),
             .init(text: "预定会议丶", confidence: 0.3, visionBox: CGRect(x: 0.15, y: 0.4, width: 0.1, height: 0.04)),
@@ -49,9 +49,45 @@ final class VisualControlObserverTests: XCTestCase {
         let selected = try XCTUnwrap(candidates.first)
         let original = snapshot(candidates)
         XCTAssertEqual(Observer.revalidatedCandidate(selected, from: original, in: original), selected)
-        // A later recognition that changes the exact label cannot reuse consent.
-        let changed = Observer.Candidate(id: selected.id, text: "快速会议", normalizedBox: selected.normalizedBox)
-        XCTAssertNil(Observer.revalidatedCandidate(selected, from: original, in: snapshot([changed])))
+        for text in ["快速会议", "快速会议～", "快速会议 ~", "快速会议▾"] {
+            let changed = Observer.Candidate(id: selected.id, text: text, normalizedBox: selected.normalizedBox)
+            XCTAssertEqual(Observer.revalidatedCandidate(selected, from: original, in: snapshot([changed])), changed)
+        }
+        let changedMeaning = Observer.Candidate(id: selected.id, text: "加入会议", normalizedBox: selected.normalizedBox)
+        XCTAssertNil(Observer.revalidatedCandidate(selected, from: original, in: snapshot([changedMeaning])))
+    }
+
+    func testChevronNormalizationPreservesNumbersInternalSymbolsAndMeaningfulPunctuation() {
+        for text in ["快速会议!", "快速会议?", "A~B", "Plan +", "Plan -", "1~", "1", "C++", "C#", "Name >", "丶"] {
+            XCTAssertEqual(Observer.labelIdentity(text), text)
+        }
+        XCTAssertEqual(Observer.labelIdentity("  快速会议 丶  "), "快速会议")
+        XCTAssertEqual(Observer.labelIdentity("  Quick meeting ～  "), "Quick meeting")
+        XCTAssertEqual(Observer.labelIdentity("  "), "")
+        // Returned indices belong to the original string and can be passed to
+        // Vision to bound the content without its adjacent dropdown glyph.
+        let text = "  快速会议 丶  "
+        XCTAssertEqual(String(text[Observer.labelContentRange(in: text)]), "快速会议")
+    }
+
+    func testChevronEquivalentDuplicatesAreRejectedBeforeTheCandidateLimit() {
+        let box = CGRect(x: 0.1, y: 0.2, width: 0.2, height: 0.1)
+        let observations: [Observer.TextObservation] = [
+            .init(text: "快速会议丶", confidence: 0.3, visionBox: box),
+            .init(text: "快速会议～", confidence: 0.3, visionBox: box.offsetBy(dx: 0.4, dy: 0)),
+            .init(text: "预定会议", confidence: 0.9, visionBox: box.offsetBy(dx: 0, dy: 0.2))
+        ]
+        XCTAssertEqual(Observer.candidates(from: observations, bounds: bounds).map(\.text), ["预定会议"])
+        let selected = candidate(text: "快速会议丶")
+        let duplicate = candidate(id: "visual_2", text: "快速会议～", dx: 0.4)
+        XCTAssertNil(Observer.revalidatedCandidate(selected, from: snapshot([selected]), in: snapshot([selected, duplicate])))
+        XCTAssertNil(Observer.revalidatedCandidate(selected, from: snapshot([selected, duplicate]), in: snapshot([selected])))
+    }
+
+    func testChevronNormalizationCannotHideRealTargetMovement() {
+        let selected = candidate(text: "快速会议丶")
+        let moved = candidate(text: "快速会议～", dx: 0.011)
+        XCTAssertNil(Observer.revalidatedCandidate(selected, from: snapshot([selected]), in: snapshot([moved])))
     }
 
     func testCandidatesAreBoundedAndOrderedByScreenPosition() {
